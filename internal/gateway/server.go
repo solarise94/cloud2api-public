@@ -692,10 +692,14 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, acct config.A
 	s.doUpstreamJSON(w, req)
 }
 
-// handleRaw streams a download from OpenList's /p proxy endpoint; the body
+// handleRaw streams a download from OpenList's /d download endpoint; the body
 // is relayed with io.Copy and never buffered (§7). OpenList requires a
-// per-file sign parameter on /p, so the sign is fetched server-side with a
-// fs/get call first; any client-supplied sign is discarded.
+// per-file sign parameter on /d, so the sign is fetched server-side with a
+// fs/get call first; any client-supplied sign is discarded. The query is a
+// strict whitelist — the server-fetched sign plus the caller's own `type`
+// selector when one was supplied — so a client key, path or any other query
+// parameter is never forwarded upstream. DoDownload follows OpenList's
+// direct-link 302 server-side, so the upstream URL never reaches the client.
 func (s *Server) handleRaw(w http.ResponseWriter, r *http.Request, acct config.Account, logicalTail string) {
 	setAuditPath(r, "/"+logicalTail)
 	internal, ok := s.guardTranslate(w, r, acct.ID, "/"+logicalTail)
@@ -713,9 +717,12 @@ func (s *Server) handleRaw(w http.ResponseWriter, r *http.Request, acct config.A
 		return
 	}
 
-	q := r.URL.Query()
+	q := url.Values{}
 	q.Set("sign", sign)
-	u := url.URL{Path: "/p" + internal, RawQuery: q.Encode()}
+	if t := r.URL.Query().Get("type"); t != "" {
+		q.Set("type", t)
+	}
+	u := url.URL{Path: "/d" + internal, RawQuery: q.Encode()}
 	hdr := http.Header{}
 	for _, h := range []string{"Range", "If-None-Match", "If-Modified-Since", "If-Range", "Accept"} {
 		if v := r.Header.Get(h); v != "" {
@@ -723,19 +730,21 @@ func (s *Server) handleRaw(w http.ResponseWriter, r *http.Request, acct config.A
 		}
 	}
 
-	req, err := s.client.NewRequest(ctx, http.MethodGet, u, nil, 0, hdr)
+	resp, err := s.client.DoDownload(ctx, http.MethodGet, u, hdr)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to build upstream request")
-		return
-	}
-	// Bodyless request: safe to self-heal and retry on a 401.
-	resp, err := s.client.DoAutoHeal(req)
-	if err != nil {
+		// Generic on purpose: a transport error's text embeds the (redirect)
+		// URL, which must not leak into the response.
 		s.log.Warn("raw upstream request failed", "err", err)
 		writeError(w, http.StatusBadGateway, "upstream request failed")
 		return
 	}
 	defer resp.Body.Close()
+	// A redirect the helper should have followed server-side is an upstream
+	// failure: forwarding it would leak the direct-link URL via Location.
+	if rawRedirect(resp.StatusCode) {
+		writeError(w, http.StatusBadGateway, "upstream returned "+resp.Status)
+		return
+	}
 
 	for _, h := range []string{"Content-Type", "Content-Length", "Content-Disposition", "Content-Range", "Accept-Ranges", "ETag", "Last-Modified", "Cache-Control"} {
 		if v := resp.Header.Get(h); v != "" {
@@ -746,6 +755,17 @@ func (s *Server) handleRaw(w http.ResponseWriter, r *http.Request, acct config.A
 	if _, err := io.Copy(w, resp.Body); err != nil {
 		s.log.Warn("raw response copy interrupted", "err", err)
 	}
+}
+
+// rawRedirect reports whether status is one of the redirect codes the openlist
+// DoDownload helper follows server-side; a residual redirect is a failure.
+func rawRedirect(status int) bool {
+	switch status {
+	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther,
+		http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+		return true
+	}
+	return false
 }
 
 // fetchSign resolves the download sign for an internal path via fs/get.

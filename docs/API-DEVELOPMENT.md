@@ -1,3 +1,5 @@
+[简体中文](API-DEVELOPMENT.md) | [English](API-DEVELOPMENT.en.md)
+
 # 开发接口分层与完整协议
 
 本文面向项目维护者、管理员和高级集成开发者，**不是默认交给 Agent 的接入提示**。
@@ -103,7 +105,7 @@ links、fetch 的指定网盘使用请求体中的 drive；transfers 的源和�
 
 | 管理能力 | 入口与源码 |
 | --- | --- |
-| 门户管理员登录与会话 | `/admin/`、`/admin/api/login`、`/admin/api/logout`；`internal/admin/session.go`、`portal.go` |
+| 门户管理员登录与会话（持久化到 SQLite，TTL 取 `admin.session_ttl` 配置、默认 24 小时；重启后仍有效，修改管理员密码使既有会话失效） | `/admin/`、`/admin/api/login`、`/admin/api/logout`；`internal/admin/session.go`、`portal.go` |
 | 网盘发现、纳管、同步、解绑与身份确认 | `/admin/api/drives` 及其单盘子资源；`internal/admin/drives.go`、`internal/reconcile/` |
 | Key 创建、编辑、撤销、轮换 | `/admin/api/keys` 及其子资源；`internal/admin/keys.go` |
 | 设置、审计与维护 | 门户相应的 `/admin/api/*`；`internal/admin/portal.go` |
@@ -119,9 +121,20 @@ GoAPI 驱动由 OpenList 使用远端 `/v1` 层级协议，其文件操作与基
 
 ### 人用文件工作台
 
-`/files/` 是人用文件客户端，不是新的管理接口。单一授权网盘在登录后直接进入文件列表，多个网盘先显示选择页；管理员会话不会自动变成数据面 Key，也不为它新增全盘代理。公开静态页与其白名单资源由 `internal/admin/files.go` 提供，文件操作仍使用既有 Key 鉴权及存储身份守卫。默认 Agent 提示无需加载 UI 或增加新操作。
+`/files/` 是人用文件客户端，不是新的管理接口。根地址 `/` 是公开导航页，只提供文件空间与管理门户入口；`/files/` 列出当前浏览器仍有效的工作区并接受添加 Key；`/files/w/<id>/` 是同一静态文件页，`id` 为随机的非秘密入口标识，可收藏但 URL 本身不授权。单一授权网盘在登录后直接进入文件列表，多个网盘先显示选择页；管理员会话不会自动变成数据面 Key，也不为它新增全盘代理。静态页与其白名单资源由 `internal/admin` 提供装配，工作区登录与会话 API 由 `internal/agentapi/workspaces.go` 处理，文件操作仍使用既有 Key 鉴权及存储身份守卫。使用方式与会话边界见 [文件工作台说明](FILE-WORKSPACE.md)。默认 Agent 提示无需加载 UI 或增加新操作。
 
-浏览器原生下载使用独立的 UI 辅助协议，**不加入 Agent 基础清单或 `routeTable` 的协议快照计数**：
+登录与持久会话使用一组仅供页面 UI 的同源端点，**不进入 Agent 基础清单或 `routeTable` 的协议快照计数**：
+
+| 方法 | 路径 | 边界 |
+| --- | --- | --- |
+| POST | `/files/api/login` | 用 API Key 登录并签发 HttpOnly 会话 Cookie（Path=/files、SameSite=Strict），返回 `{workspace_id,url,expires_at}`；不回显 Key，数据库只存 token 哈希 |
+| GET | `/files/api/workspaces` | 只列当前浏览器拥有且仍有效的工作区入口，不返回 Key 哈希或会话 token |
+| POST | `/files/w/<id>/api/logout` | 仅删除当前浏览器的该工作区会话，成功后回 `/files/` |
+| 任意 | `/files/w/<id>/api/v1/<suffix>` | 同源 UI 适配（`X-C2A-Workspace: 1`）：页面实际使用的 me、目录/文件操作、links、download-ticket；不得成为全部高级/管理 API 的 Cookie 代理 |
+
+每个工作区固定 30 天绝对有效期，无滑动续期；同一浏览器最多 16 个有效工作区。原机器 `/v1/*`、legacy API 与 relay 不接受这些 Cookie，仍只使用 Key 请求头；文件 Cookie 也不能访问管理接口。服务端在每次恢复与调用时重查当前 Key 的存在、撤销、过期与凭据版本，权限、根目录、限额、限流、审计与存储守卫按当前 Key 实时生效，不缓存授权快照；检查失败只使该工作区失效。
+
+浏览器原生下载同样使用仅供 UI 的辅助协议：
 
 | 方法 | 路径 | 边界 |
 | --- | --- | --- |

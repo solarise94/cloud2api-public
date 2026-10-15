@@ -4,24 +4,41 @@
  * 分享该 Key 已授权的网盘。不是管理员登录，也不是 OpenList 登录；不调用任何
  * /admin/* 数据接口。
  *
+ * 持久工作区（正式模式，无 ?mock=1）：
+ *   - 登录 POST /files/api/login {api_key, workspace_id?} → {workspace_id,url,
+ *     expires_at}；之后浏览器凭 HttpOnly Cookie（c2a_files）访问该工作区。
+ *   - 数据面走同源适配 /files/w/<id>/api/v1/<suffix>，请求固定带
+ *     X-C2A-Workspace: 1，fetch credentials:'same-origin'，上传 XHR 同源携带
+ *     Cookie；页面不再持有原始 Key（KEY 恒为空），登录输入框提交后立即清空。
+ *   - /files/ 启动先 GET /files/api/workspaces 恢复本浏览器的入口列表：
+ *     恰好一个有效入口时 history.replaceState 直入其 /files/w/<id>/；多个入口
+ *     时列表可选 + 添加 Key；零入口时直接显示登录门。显式「切换工作区」与
+ *     退出后一律只列列表/添加 Key，不自动恢复单项——否则单 Key 用户永远
+ *     无从添加第二个 Key。
+ *   - 服务器返回的入口 URL 只接受与入口格式一致的相对路径
+ *     （/files/w/<id>/，与 id 一致），其余一律拒绝，不信任任何重定向目标。
+ *
  * 安全不变量：
- *   - Key 只存在于本模块的 KEY 变量（内存）中：绝不写入 URL/查询串、
- *     localStorage、sessionStorage、Cookie，也绝不放进下载链接的 href。
- *   - fetch 请求 credentials:'omit'，XHR 不启用跨域凭据；API 鉴权走 apikey
- *     请求头，原生下载只使用短时单文件凭证。管理 Cookie 限于 /admin。
+ *   - 正式模式 Key 只在登录请求体里出现一次，用完立即清输入与局部变量，
+ *     绝不写入 URL/查询串、localStorage、sessionStorage、Cookie 或下载链接。
+ *     Mock 模式仍用内存 KEY（mockKEY）驱动内存后端，零真实网络。
+ *   - 原生下载只使用短时单文件凭证；不使用 Blob/对象 URL 缓冲整文件。
  *   - 所有服务器数据一律 createElement/textContent 渲染，绝不 innerHTML。
  *   - authGen（会话代）与 navGen（浏览代）快照使过期响应、过期列表、过期
- *     对话框、过期上传回调无法写入 UI；登出/重登后无法复制/下载。
- *   - pagehide 与登出都会清除 Key、File 引用并中止本页在途 API 请求；
- *     已交给浏览器下载器的任务不由页面管理。
+ *     对话框、过期上传回调无法写入 UI；登出/切换/重登后无法复制/下载。
+ *   - pagehide 与登出都会清除内存状态并中止本页在途 API 请求；pagehide 不向
+ *     服务端注销持久会话；退出只 POST 当前工作区的 /files/w/<id>/api/logout。
+ *   - 会话失效（401）回到该入口的重登录门，登录自动携带 workspace_id，
+ *     不能用另一个 Key 覆盖既有入口。
  *   - 上传成功只认服务器 2xx + 完整 JSON {path,size,crc64,sha256,conflict} 且
  *     path/size 与目标一致；2xx 无字段 / 响应畸形 = 未确认；网络中断/取消 =
  *     未知。两者都不算成功、不回滚、不盲目重试。100% 传输只是发送完毕，
  *     仍在等待上游确认。零字节文件走 multipart（FormData file 字段），避免
  *     后端拒绝 Content-Length<=0 的裸 PUT。
  *
- * Mock：?mock=1 时所有请求路由到内存 mock（零真实网络请求），并仅在此时
- * 暴露 window.__FILES_MOCK = { map, calls, reset, keys }。
+ * Mock：?mock=1 时所有请求路由到内存 mock（零真实网络请求，不伪造持久
+ * Cookie，不调用 /files/api/*），并仅在此时暴露
+ * window.__FILES_MOCK = { map, calls, reset, keys }。
  */
 (function () {
   'use strict';
@@ -32,11 +49,13 @@
   var MOCK = false;
   try { MOCK = new URLSearchParams(location.search).get('mock') === '1'; } catch (e) { MOCK = false; }
 
-  var KEY = '';      // API Key：仅内存
+  var KEY = '';      // API Key：仅 mock 模式在内存持有（mockKEY）；正式模式恒为空
   var ME = null;     // GET /v1/me 载荷
+  var WS = null;     // 当前工作区入口 {id,url,expires_at}（正式模式；mock 恒为 null）
+  var reloginWsId = ''; // 等待重新登录的入口 id（正式模式；登录时随 body 提交）
   var authGen = 0;   // 会话代：登录提交 / 登出时自增
   var navGen = 0;    // 浏览代：每次目录加载 / 离开浏览时自增
-  var loginSeq = 0;  // 使最后一次登录尝试胜出
+  var loginSeq = 0;  // 使最后一次登录/入口选择尝试胜出
   var taskSeq = 0;
   var dialogSeq = 0;
 
@@ -57,8 +76,9 @@
   /* ---------------- element cache ---------------- */
 
   var el = {};
-  var IDS = ['mock-banner', 'gate', 'login-form', 'key', 'key-toggle', 'gate-err', 'gate-go',
-    'workspace', 'me-prefix', 'theme-toggle', 'logout', 'notice',
+  var IDS = ['mock-banner', 'gate', 'gate-hint', 'login-form', 'key', 'key-toggle', 'gate-err', 'gate-go',
+    'ws-list', 'ws-sub', 'ws-grid', 'ws-add-key',
+    'workspace', 'me-prefix', 'theme-toggle', 'switch-ws', 'logout', 'notice',
     'drives-home', 'drives-sub', 'drive-grid',
     'browser-view', 'breadcrumb', 'back-drives', 'manager-toggle', 'file-manager', 'page-search', 'refresh-btn', 'mkdir-btn',
     'dropzone', 'dz-title', 'dz-text', 'upload-hint', 'choose-files', 'conflict-mode', 'overwrite-row', 'overwrite-ok', 'file-input',
@@ -272,7 +292,17 @@
 
   /* ---------------- transport ----------------
    * api() 返回 {status, ok, json, headers, network}，从不抛出。
-   * mock 模式走 mockRequest；真实模式 fetch + apikey 头 + credentials:'omit'。 */
+   * mock 模式走 mockRequest（零真实网络）；正式模式 fetch + X-C2A-Workspace 头
+   * + credentials:'same-origin'（Cookie 会话），无 apikey 长期 Key 头；
+   * /v1/* 数据路径映射到当前入口的 /files/w/<id>/api/v1/* 同源适配。 */
+
+  function apiPath(p) {
+    if (MOCK) return p;
+    if (WS && WS.id && p.lastIndexOf('/v1/', 0) === 0) {
+      return '/files/w/' + encodeURIComponent(WS.id) + '/api' + p;
+    }
+    return p;
+  }
 
   function api(method, path, opts) {
     opts = opts || {};
@@ -290,13 +320,18 @@
     aborts.add(ctrl);
     var gen = authGen;
     var qs = opts.query ? '?' + opts.query.toString() : '';
-    var headers = { 'apikey': KEY };
-    var init = { method: method, credentials: 'omit', headers: headers, signal: ctrl.signal };
+    var init = {
+      method: method,
+      credentials: 'same-origin',
+      headers: { 'X-C2A-Workspace': '1' },
+      signal: ctrl.signal
+    };
+    if (opts.keepalive) init.keepalive = true;
     if (opts.json !== undefined) {
       init.headers['Content-Type'] = 'application/json';
       init.body = JSON.stringify(opts.json);
     }
-    return fetch(path + qs, init).then(function (res) {
+    return fetch(apiPath(path) + qs, init).then(function (res) {
       return res.json().catch(function () { return null; }).then(function (doc) {
         aborts.delete(ctrl);
         return { status: res.status, ok: res.ok, json: doc, headers: res.headers, gen: gen };
@@ -722,37 +757,287 @@
 
   function gateErr(t) { clear(el['gate-err']); if (t) el['gate-err'].appendChild(document.createTextNode(t)); }
 
+  var GATE_HINT_DEFAULT = '输入访问密钥，查看已授权的网盘，上传和分享文件。';
+  function resetGateHint() {
+    reloginWsId = '';
+    if (el['gate-hint']) el['gate-hint'].textContent = GATE_HINT_DEFAULT;
+  }
+  function applyReloginContext(id) {
+    reloginWsId = id;
+    if (el['gate-hint']) {
+      el['gate-hint'].textContent = '工作区 ' + shortWsId(id) + ' 的登录已失效：请输入创建该工作区时使用的 API Key 重新登录（其他 Key 无法接管此入口）。';
+    }
+  }
+  function shortWsId(id) {
+    id = String(id || '');
+    return id.length > 10 ? id.slice(0, 8) + '…' : id;
+  }
+
+  /* 服务器返回的入口只允许与入口格式一致的相对路径（与 id 一致），
+   * 绝不信任绝对 URL / 跨源 / 查询串 / 其他路径形态。
+   * 登录响应字段是 workspace_id，/workspaces 列表字段是 id，两者都接受。 */
+  var WS_ID_RE = /^[A-Za-z0-9_-]{8,128}$/;
+  function sanitizeEntry(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    var id = (raw.id !== undefined && raw.id !== null) ? raw.id : raw.workspace_id;
+    var url = raw.url;
+    if (typeof id !== 'string' || !WS_ID_RE.test(id)) return null;
+    if (typeof url !== 'string' || !url) return null;
+    var u;
+    try { u = new URL(url, location.origin); } catch (e) { return null; }
+    if (u.origin !== location.origin) return null;
+    if (!/^\/files\/w\/[A-Za-z0-9_-]{8,128}\/$/.test(u.pathname)) return null;
+    if (u.search || u.hash || u.username || u.password) return null;
+    if (u.pathname !== '/files/w/' + id + '/') return null; // url 与 id 必须一致
+    if (raw.expires_at !== undefined && raw.expires_at !== null && typeof raw.expires_at !== 'string') return null;
+    return {
+      id: id,
+      url: '/files/w/' + id + '/',
+      expires_at: typeof raw.expires_at === 'string' ? raw.expires_at : ''
+    };
+  }
+  function sanitizeEntries(list) {
+    var out = [];
+    var seen = {};
+    (Array.isArray(list) ? list : []).forEach(function (raw) {
+      var en = sanitizeEntry(raw);
+      if (en && !seen[en.id]) { seen[en.id] = true; out.push(en); }
+    });
+    return out;
+  }
+
   function doLogin(ev) {
     ev.preventDefault();
     var v = el.key.value.trim();
     if (!v) { gateErr('请输入访问密钥（API Key，sk-c2a-…）'); return; }
     el['gate-go'].disabled = true;
     gateErr('');
-    KEY = v;
-    var myLogin = ++loginSeq;
-    var p = api('GET', '/v1/me');
-    p.then(function (res) {
-      if (myLogin !== loginSeq) return; // 已被新的登录/登出取代
+    if (MOCK) {
+      KEY = v;
+      var myLogin = ++loginSeq;
+      var p = api('GET', '/v1/me');
+      p.then(function (res) {
+        if (myLogin !== loginSeq) return; // 已被新的登录/登出取代
+        el['gate-go'].disabled = false;
+        if (res.status === 200 && res.json && Array.isArray(res.json.drives) && res.json.key) {
+          authGen++;
+          el.key.value = '';
+          el.key.type = 'password';
+          el['key-toggle'].textContent = '显示';
+          ME = res.json;
+          enterWorkspace();
+          return;
+        }
+        KEY = '';
+        if (res.network) gateErr('网络错误：无法连接服务器，请稍后重试');
+        else if (res.status === 401 || res.status === 403) gateErr('密钥无效或已被吊销（HTTP ' + res.status + '），请检查后重试');
+        else if (res.status === 429) gateErr('尝试过于频繁（HTTP 429）' + retryAfterText(res.headers) + '，请稍后再试');
+        else gateErr('读取授权失败（HTTP ' + (res.status || '?') + '）：' + errText(res, '请稍后重试'));
+      });
+      return;
+    }
+    /* 正式模式：Key 用完立即清输入；本页从此不持有原始 Key，后续凭 Cookie。 */
+    el.key.value = '';
+    el.key.type = 'password';
+    el['key-toggle'].textContent = '显示';
+    var mySeq = ++loginSeq;
+    var targetWs = reloginWsId; // 指定入口的重登录必须携带 workspace_id，不能被其他 Key 覆盖
+    var body = { api_key: v };
+    v = null; // 局部变量即时清除
+    if (targetWs) body.workspace_id = targetWs;
+    api('POST', '/files/api/login', { json: body }).then(function (res) {
+      if (mySeq !== loginSeq) return; // 已被新的登录/入口选择取代
       el['gate-go'].disabled = false;
+      if (res.status === 200 && res.json) {
+        var entry = sanitizeEntry(res.json);
+        if (!entry) { gateErr('服务器返回的工作区入口不合法，已拒绝进入'); return; }
+        if (targetWs && entry.id !== targetWs) { gateErr('登录返回的入口与目标工作区不一致，已拒绝进入'); return; }
+        authGen++;
+        resetGateHint();
+        WS = entry;
+        try { history.replaceState(null, '', entry.url); } catch (e) { /* noop */ }
+        showWsBooting('正在打开工作区 ' + shortWsId(entry.id) + '…');
+        loadMeIntoWorkspace();
+        return;
+      }
+      if (res.network) gateErr('网络错误：无法连接服务器，请稍后重试');
+      else if (res.status === 401 || res.status === 403) gateErr('密钥无效或已被吊销（HTTP ' + res.status + '），请检查后重试');
+      else if (res.status === 429) gateErr('尝试过于频繁（HTTP 429）' + retryAfterText(res.headers) + '，请稍后再试');
+      else gateErr('登录失败（HTTP ' + (res.status || '?') + '）：' + errText(res, '请稍后重试'));
+    });
+  }
+
+  /* ---------------- 工作区恢复 / 入口选择（正式模式） ---------------- */
+
+  function showGateOnly() {
+    el.workspace.hidden = true;
+    el['ws-list'].hidden = true;
+    el.gate.hidden = false;
+  }
+  function showWsBooting(text) {
+    el.gate.hidden = true;
+    el.workspace.hidden = true;
+    el['ws-list'].hidden = false;
+    clear(el['ws-grid']);
+    el['ws-sub'].textContent = text;
+  }
+  /* 打开某个入口期间保留列表卡片：响应悬空时仍可改选其他入口。 */
+  function showWsOpening(text) {
+    el.gate.hidden = true;
+    el.workspace.hidden = true;
+    el['ws-list'].hidden = false;
+    el['ws-sub'].textContent = text;
+  }
+
+  function renderWsList(entries) {
+    el.gate.hidden = true;
+    el.workspace.hidden = true;
+    el['ws-list'].hidden = false;
+    el['ws-sub'].textContent = '此浏览器保存了 ' + entries.length + ' 个有效的文件工作区：选择一个入口继续，或添加其他 API Key。';
+    clear(el['ws-grid']);
+    entries.forEach(function (en) {
+      var card = h('div', { 'class': 'fx-ws-card', 'data-ws-id': en.id });
+      card.appendChild(h('div', { 'class': 'fx-ws-name', text: '工作区 ' + shortWsId(en.id) }));
+      card.appendChild(h('div', { 'class': 'fx-ws-meta mono', text: '入口 ' + en.id }));
+      if (en.expires_at) card.appendChild(h('div', { 'class': 'fx-ws-meta', text: '有效期至 ' + fmtTime(en.expires_at) }));
+      var go = h('button', { 'class': 'btn btn-primary', type: 'button', text: '进入' });
+      go.setAttribute('aria-label', '进入工作区 ' + en.id);
+      go.addEventListener('click', function () { chooseEntry(en); });
+      var foot = h('div', { 'class': 'fx-ws-foot' });
+      foot.appendChild(go);
+      card.appendChild(foot);
+      el['ws-grid'].appendChild(card);
+    });
+  }
+
+  function chooseEntry(en) {
+    authGen++;
+    navGen++;
+    loginSeq++;
+    closeDialogs();
+    ME = null;
+    VIEW = freshView();
+    WS = en;
+    try { history.pushState(null, '', en.url); } catch (e) { /* noop */ }
+    showWsOpening('正在打开工作区 ' + shortWsId(en.id) + '…');
+    loadMeIntoWorkspace();
+  }
+
+  /* 从 /files/w/<id>/ 深链接恢复：入口 id 来自本页 URL（格式已校验）。 */
+  function deepRestore(id) {
+    loginSeq++;
+    WS = { id: id, url: '/files/w/' + id + '/', expires_at: '' };
+    showWsBooting('正在打开工作区 ' + shortWsId(id) + '…');
+    loadMeIntoWorkspace();
+  }
+
+  /* GET /files/api/workspaces 后按场景分流：
+   * - 启动 /files/（bootWorkspaces）：恰好一个有效入口时 history.replaceState 直入；
+   * - 显式切换 / 退出后（listWorkspaces）：一律只列列表/添加 Key，绝不自动恢复，
+   *   否则单 Key 用户永远看不到“添加 API Key”的入口。 */
+  function fetchWorkspaces(onDone) {
+    showWsBooting('正在获取已保存的工作区…');
+    var gen = authGen;
+    var seq = loginSeq;
+    api('GET', '/files/api/workspaces').then(function (res) {
+      if (gen !== authGen || seq !== loginSeq) return; // 已有新的登录/入口动作
+      if (res.status === 200 && res.json && Array.isArray(res.json.workspaces)) {
+        onDone(sanitizeEntries(res.json.workspaces));
+        return;
+      }
+      showGateOnly();
+      if (res.network) gateErr('网络错误：无法获取已保存的工作区，可直接输入密钥登录');
+      else gateErr('获取工作区列表失败（HTTP ' + (res.status || '?') + '），可直接输入密钥登录');
+    });
+  }
+  function bootWorkspaces() {
+    fetchWorkspaces(function (entries) {
+      if (entries.length === 1) {
+        WS = entries[0];
+        try { history.replaceState(null, '', WS.url); } catch (e) { /* noop */ }
+        showWsBooting('正在恢复工作区 ' + shortWsId(WS.id) + '…');
+        loadMeIntoWorkspace();
+        return;
+      }
+      if (entries.length > 1) { renderWsList(entries); return; }
+      showGateOnly();
+    });
+  }
+  function listWorkspaces() {
+    fetchWorkspaces(function (entries) {
+      if (entries.length) { renderWsList(entries); return; }
+      showGateOnly();
+    });
+  }
+
+  /* list=true：显式切换/退出后只列列表；false（默认）：启动语义，可单项直入。 */
+  function toFilesHome(list) {
+    try { history.pushState(null, '', '/files/'); } catch (e) { /* noop */ }
+    if (list) listWorkspaces();
+    else bootWorkspaces();
+  }
+
+  /* 进入入口后先 /me（沿用原 /v1 返回），成功才真正进工作区。 */
+  function loadMeIntoWorkspace() {
+    var gen = authGen;
+    var seq = loginSeq;
+    var entry = WS;
+    api('GET', '/v1/me').then(function (res) {
+      if (gen !== authGen || seq !== loginSeq || entry !== WS) return; // 过期响应
       if (res.status === 200 && res.json && Array.isArray(res.json.drives) && res.json.key) {
         authGen++;
-        el.key.value = '';
-        el.key.type = 'password';
-        el['key-toggle'].textContent = '显示';
         ME = res.json;
         enterWorkspace();
         return;
       }
-      KEY = '';
-      if (res.network) gateErr('网络错误：无法连接服务器，请稍后重试');
-      else if (res.status === 401 || res.status === 403) gateErr('密钥无效或已被吊销（HTTP ' + res.status + '），请检查后重试');
-      else if (res.status === 429) gateErr('尝试过于频繁（HTTP 429）' + retryAfterText(res.headers) + '，请稍后再试');
-      else gateErr('读取授权失败（HTTP ' + (res.status || '?') + '）：' + errText(res, '请稍后重试'));
+      if (res.network) { entryOpenFail('网络错误：无法连接服务器，请重试'); return; }
+      if (res.status === 401 || res.status === 403) {
+        startRelogin(entry ? entry.id : '', '登录已失效（HTTP ' + res.status + '）：此工作区的会话无效或已过期，请重新登录');
+        return;
+      }
+      entryOpenFail('打开工作区失败（HTTP ' + (res.status || '?') + '）：' + errText(res, '请稍后重试'));
+    });
+  }
+  function entryOpenFail(t) {
+    if (!el['ws-list'].hidden) {
+      el['ws-sub'].textContent = t;
+      return;
+    }
+    showGateOnly();
+    gateErr(t);
+  }
+
+  /* 会话失效（401）：回到该入口的重登录门；不能被另一个 Key 覆盖。 */
+  function startRelogin(id, msg) {
+    doLogout(msg || '');
+    if (id) applyReloginContext(id);
+  }
+  function sessionExpired(msg) {
+    if (MOCK) { doLogout(msg); return; }
+    var id = WS ? WS.id : reloginWsId;
+    doLogout(msg);
+    if (id) applyReloginContext(id);
+  }
+
+  /* 退出登录（正式）：立即清页面状态并中止请求，再 POST 仅当前入口的
+   * /logout；随后回 /files/。注销失败时会话仍有效，列表会如实恢复。
+   * pagehide 不走这里（不注销 Cookie）。 */
+  function productionLogout() {
+    var entry = WS;
+    doLogout('已退出登录');
+    if (!entry) { toFilesHome(true); return; }
+    var gen = authGen;
+    var seq = loginSeq;
+    api('POST', '/files/w/' + encodeURIComponent(entry.id) + '/api/logout', { keepalive: true }).then(function (res) {
+      if (gen !== authGen || seq !== loginSeq) return;
+      if (res.network) gateErr('退出请求未完成：该工作区会话仍然有效');
+      toFilesHome(true); // 只列列表/添加 Key，不自动恢复
     });
   }
 
   function enterWorkspace() {
     el.gate.hidden = true;
+    el['ws-list'].hidden = true;
     el.workspace.hidden = false;
     hideNotice();
     var prefix = ME && ME.key && ME.key.prefix ? ME.key.prefix : '—';
@@ -781,6 +1066,7 @@
     activeTask = null;
     KEY = '';
     ME = null;
+    WS = null;
     VIEW = freshView();
     clear(el['drive-grid']);
     clear(el['file-tbody']);
@@ -816,8 +1102,11 @@
     el['gate-go'].disabled = false;
     el.key.type = 'password';
     el['key-toggle'].textContent = '显示';
+    resetGateHint();
     hideNotice();
     el.workspace.hidden = true;
+    el['ws-list'].hidden = true;
+    clear(el['ws-grid']);
     el.gate.hidden = false;
     el.key.value = '';
     gateErr(msg || '');
@@ -1042,7 +1331,7 @@
         return;
       }
       dropListing();
-      if (res.status === 401) { doLogout('登录已失效（HTTP 401）：密钥无效或已被吊销，请重新输入'); return; }
+      if (res.status === 401) { sessionExpired('登录已失效（HTTP 401）：密钥无效或已被吊销，请重新输入'); return; }
       if (res.status === 403) {
         VIEW.loadError = 'HTTP 403：权限不足。该密钥对此网盘缺少 list 权限，或路径超出了授权根目录。';
       } else if (res.status === 429) {
@@ -1195,7 +1484,7 @@
     }).then(function (res) {
       if (gen !== authGen) return;
       if (res.status !== 200 || !res.json) {
-        if (res.status === 401) { doLogout('登录已失效（HTTP 401）：密钥无效或已被吊销，请重新输入'); return; }
+        if (res.status === 401) { sessionExpired('登录已失效（HTTP 401）：密钥无效或已被吊销，请重新输入'); return; }
         noticeErr(res.network ? '网络错误：无法准备下载，请重试' : 'HTTP ' + (res.status || '?') + '：' + errText(res, '无法准备下载'));
         return;
       }
@@ -1280,7 +1569,7 @@
         el['share-exp'].appendChild(document.createTextNode('到期：' + fmtTime(res.json.expires_at) + '（' + ttlHuman(ttl) + '）'));
         el['share-result'].hidden = false;
       } else if (res.status === 401) {
-        doLogout('登录已失效（HTTP 401）：密钥无效或已被吊销，请重新输入');
+        sessionExpired('登录已失效（HTTP 401）：密钥无效或已被吊销，请重新输入');
       } else if (res.status === 403) {
         shareErr('HTTP 403：该密钥缺少 link 权限');
       } else if (res.status === 404) {
@@ -1307,7 +1596,11 @@
     var dlgGen = dialogSeq;
     var ctx = shareCtx;
     var valid = function () {
-      return gen === authGen && dlgGen === dialogSeq && !!KEY && ctx === shareCtx &&
+      /* 认证态与模式无关：mock 看内存 KEY（mockKEY），正式看工作区会话 WS
+       * （正式 KEY 恒空，绝不能作为判据，否则复制会静默无动作）。其余
+       * gen/dialogSeq/shareCtx/对话框打开/结果可见/URL 一致校验保持不变。 */
+      var authenticated = MOCK ? !!KEY : !!WS;
+      return gen === authGen && dlgGen === dialogSeq && authenticated && ctx === shareCtx &&
         el['dlg-share'].open && !el['share-result'].hidden && el['share-url'].value === text;
     };
     var done = function () {
@@ -1371,7 +1664,7 @@
         noticeOk('已创建文件夹 ' + name);
         loadList(VIEW.page);
       } else if (res.status === 401) {
-        doLogout('登录已失效（HTTP 401）：密钥无效或已被吊销，请重新输入');
+        sessionExpired('登录已失效（HTTP 401）：密钥无效或已被吊销，请重新输入');
       } else {
         dlgErr(el['mkdir-err'], 'HTTP ' + (res.status || '?') + '：' + errText(res, '创建失败'));
       }
@@ -1409,7 +1702,7 @@
         noticeOk('已重命名为 ' + newName);
         loadList(VIEW.page);
       } else if (res.status === 401) {
-        doLogout('登录已失效（HTTP 401）：密钥无效或已被吊销，请重新输入');
+        sessionExpired('登录已失效（HTTP 401）：密钥无效或已被吊销，请重新输入');
       } else if (res.status === 409) {
         dlgErr(el['rename-err'], '目标名称已存在：' + newName + '（on_conflict=fail，请换一个名称）');
       } else {
@@ -1452,7 +1745,7 @@
         else noticeErr('删除失败：' + (r0.error || '未知错误') + '（' + (r0.path || target) + '）');
         loadList(VIEW.page);
       } else if (res.status === 401) {
-        doLogout('登录已失效（HTTP 401）：密钥无效或已被吊销，请重新输入');
+        sessionExpired('登录已失效（HTTP 401）：密钥无效或已被吊销，请重新输入');
       } else if (res.status === 200) {
         dlgErr(el['delete-err'], '服务器响应缺少逐项结果（results），删除结果未知，请刷新目录核实');
       } else {
@@ -1567,7 +1860,7 @@
       task.state = 'failed';
       task.error = 'HTTP 401：密钥已失效，上传被拒绝。';
       task.file = null;
-      doLogout('登录已失效（HTTP 401）：密钥无效或已被吊销，请重新输入');
+      sessionExpired('登录已失效（HTTP 401）：密钥无效或已被吊销，请重新输入');
     } else {
       task.state = 'failed';
       task.error = 'HTTP ' + (outcome.status || '?') + '：' + errText(outcome, '上传失败') + '。失败不代表远端未写入，请先刷新目录核实，再重新选择文件。';
@@ -1620,7 +1913,7 @@
 
   function xhrUpload(task, gen) {
     return new Promise(function (resolve) {
-      var url = '/v1/drives/' + encodeURIComponent(task.drive) + '/files' +
+      var url = apiPath('/v1/drives/' + encodeURIComponent(task.drive) + '/files') +
         '?path=' + encodeURIComponent(task.targetPath) +
         '&on_conflict=' + encodeURIComponent(task.onConflict);
       var xhr = new XMLHttpRequest();
@@ -1632,8 +1925,13 @@
         resolve({ network: true });
         return;
       }
-      xhr.withCredentials = false;
-      xhr.setRequestHeader('apikey', KEY); // Key 只进请求头，不进 URL
+      if (MOCK) {
+        xhr.withCredentials = false;
+        xhr.setRequestHeader('apikey', KEY); // mock：Key 只进请求头，不进 URL
+      } else {
+        xhr.withCredentials = true; // 正式：同源上传携带会话 Cookie，无 apikey 头
+        xhr.setRequestHeader('X-C2A-Workspace', '1');
+      }
       xhr.setRequestHeader('Idempotency-Key', uuid()); // 每次尝试唯一
       var zero = task.size === 0;
       if (!zero) xhr.setRequestHeader('Content-Type', 'application/octet-stream');
@@ -1848,7 +2146,19 @@
       el.key.type = hidden ? 'text' : 'password';
       el['key-toggle'].textContent = hidden ? '隐藏' : '显示';
     });
-    el.logout.addEventListener('click', function () { doLogout('已退出登录：密钥已从内存清除'); });
+    el.logout.addEventListener('click', function () {
+      if (MOCK) { doLogout('已退出登录：密钥已从内存清除'); return; }
+      productionLogout(); // POST 仅当前入口 /logout，成功后回 /files/
+    });
+    el['switch-ws'].addEventListener('click', function () {
+      if (MOCK) return; // mock 无持久工作区
+      doLogout(''); // 清页面状态并中止请求，但不动服务端会话
+      toFilesHome(true); // 显式切换只列列表/添加 Key，绝不自动恢复单项
+    });
+    el['ws-add-key'].addEventListener('click', function () {
+      el.gate.hidden = false;
+      try { el.key.focus(); } catch (e) { /* noop */ }
+    });
     el['theme-toggle'].addEventListener('click', toggleTheme);
 
     el['back-drives'].addEventListener('click', backToDrives);
@@ -1923,11 +2233,21 @@
       mockRegister();
       exposeMock();
       el['mock-banner'].hidden = false;
+      el['switch-ws'].hidden = true; // mock 无持久工作区
+      bindEvents();
+      el.workspace.hidden = true;
+      el['ws-list'].hidden = true;
+      el.gate.hidden = false;
+      try { el.key.focus(); } catch (e) { /* noop */ }
+      return;
     }
     bindEvents();
     el.workspace.hidden = true;
-    el.gate.hidden = false;
-    try { el.key.focus(); } catch (e) { /* noop */ }
+    el.gate.hidden = true;
+    el['ws-list'].hidden = true;
+    var m = /^\/files\/w\/([A-Za-z0-9_-]{8,128})\/$/.exec(location.pathname);
+    if (m) deepRestore(m[1]); // 指定入口：先 /me，401 回该入口的重登录门
+    else bootWorkspaces(); // 仅启动 /files/ 时允许单项自动直入
   }
 
   if (document.readyState === 'loading') {

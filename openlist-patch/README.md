@@ -1,3 +1,5 @@
+[简体中文](README.md) | [English](README.en.md)
+
 # openlist-patch：带登录适配补丁的 OpenList
 
 cloud2api 的部署由两个服务组成：本目录构建的 OpenList，以及 cloud2api。这里的补丁在固定版本的 OpenList 中加入 connect 模块，用于网盘登录、授权和存储配置；connect 4 起还包含 `goapi` 上游适配（配合新增的 GoAPI 存储驱动）与管理员免登交接（handoff）接口。文件引擎、驱动和续期仍由上游 OpenList 负责。cloud2api only links to the patch pages; it never receives credentials or writes storage config. 当前接口契约见 [API 文档](docs/API.md)，适配方法见 [贡献指南](docs/CONTRIBUTING-adapters.md)。

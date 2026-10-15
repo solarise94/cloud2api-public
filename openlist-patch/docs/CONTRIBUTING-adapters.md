@@ -1,3 +1,5 @@
+[简体中文](CONTRIBUTING-adapters.md) | [English](CONTRIBUTING-adapters.en.md)
+
 # 增加平台适配器
 
 登录 SDK 的适配器随代码构建，在编译时注册，没有动态插件加载。增加一个平台通常只需要提交三样东西：`src/pkg/loginsdk/adapters/<名称>/` 下的适配器包和测试、[`adapters/all/all.go`](../src/pkg/loginsdk/adapters/all/all.go) 中的一行 `Register`，以及 [PLATFORMS.md](PLATFORMS.md) 中的说明。不需要修改其他平台、OpenList 驱动、配置适配层（`internal/loginbridge`）、HTTP 层（`server/connect`）或 cloud2api。

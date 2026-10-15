@@ -250,6 +250,29 @@ CREATE TABLE relay_uploads (
 CREATE INDEX idx_relay_uploads_key ON relay_uploads(key_id);
 CREATE INDEX idx_relay_uploads_updated ON relay_uploads(updated_at);
 `,
+	// v6: persistent browser workspaces (DESIGN-persistent-workspaces §3).
+	// file_workspaces maps one stable non-secret entry id per API key;
+	// web_sessions stores cookie tokens as SHA-256 hashes only (never the
+	// raw token, a plaintext key or a credential), shared by the admin and
+	// files kinds. Non-destructive: old binaries simply ignore these tables.
+	`
+CREATE TABLE file_workspaces (
+	id         TEXT PRIMARY KEY,
+	key_id     TEXT UNIQUE NOT NULL,
+	created_at TEXT NOT NULL
+);
+CREATE TABLE web_sessions (
+	token_hash     TEXT NOT NULL,
+	kind           TEXT NOT NULL,
+	workspace_id   TEXT NOT NULL,
+	subject_id     TEXT NOT NULL DEFAULT '',
+	credential_tag TEXT NOT NULL DEFAULT '',
+	created_at     TEXT NOT NULL,
+	expires_at     TEXT NOT NULL,
+	PRIMARY KEY (token_hash, kind, workspace_id)
+);
+CREATE INDEX idx_web_sessions_expires ON web_sessions(expires_at);
+`,
 }
 
 func (s *Store) migrate() error {

@@ -166,16 +166,12 @@ func (s *Server) getBytes(ctx context.Context, internal string) ([]byte, error) 
 			return nil, err
 		}
 	}
-	u, err := url.Parse("/p" + internal)
-	if err != nil {
-		return nil, err
-	}
-	u.RawQuery = "sign=" + sign
-	req, err := s.client.NewRequest(ctx, http.MethodGet, *u, nil, 0, nil)
-	if err != nil {
-		return nil, err
-	}
-	resp, err := s.client.DoAutoHeal(req)
+	q := url.Values{}
+	q.Set("sign", sign)
+	u := url.URL{Path: "/d" + internal, RawQuery: q.Encode()}
+	// DoDownload follows OpenList's /d direct-link 302 server-side, so the
+	// read-back never needs the upstream URL itself.
+	resp, err := s.client.DoDownload(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
 	}

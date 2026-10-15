@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"mime"
 	"net/http"
+	"net/url"
 	"path"
 	"strconv"
 	"strings"
@@ -35,16 +36,21 @@ const (
 	maxAdminRequestBody = 1 << 20
 )
 
-// Portal serves the management UI and JSON API under /admin (UPGRADE §8.2).
+// Portal serves the management UI and JSON API under /admin (UPGRADE §8.2)
+// and the public file workspace / relay shells.
 type Portal struct {
 	cfg      config.Admin
 	registry *gateway.AccountRegistry
 	client   *openlist.Client
 	st       *store.Store
 	keys     *keymgr.Manager
-	sessions *SessionStore
-	logins   *loginLimiter
-	log      *slog.Logger
+	sessions sessionBackend
+	// sessSecret is the persistent random HMAC secret behind the session
+	// credential tags; empty when session storage is unavailable, in which
+	// case sessions fail closed.
+	sessSecret []byte
+	logins     *loginLimiter
+	log        *slog.Logger
 
 	reconciler *reconcile.Reconciler
 	// guard performs the fresh per-request storage verification the reauth
@@ -58,6 +64,13 @@ type Portal struct {
 	loginPage []byte
 	appPage   []byte
 	relayPage []byte
+	homePage  []byte
+
+	// workspaceHandler is the /files API handler installed by main
+	// (agentapi WorkspaceHandler, DESIGN §5.1). While it is unset every
+	// /files API request fails closed instead of falling through.
+	workspaceMu     sync.RWMutex
+	workspaceHandle http.Handler
 
 	storageMu   sync.Mutex
 	storageAt   time.Time
@@ -83,20 +96,80 @@ func NewPortal(cfg *config.Admin, registry *gateway.AccountRegistry, client *ope
 	if logger == nil {
 		logger = slog.Default()
 	}
+	ttl := cfg.SessionTTL.Standard()
+	if ttl <= 0 {
+		ttl = config.DefaultSessionTTL
+	}
 	p := &Portal{
 		cfg:      *cfg,
 		registry: registry,
 		client:   client,
 		st:       st,
 		keys:     keys,
-		sessions: NewSessionStore(cfg.SessionTTL.Standard()),
 		logins:   newLoginLimiter(),
 		log:      logger,
+	}
+	// Admin sessions are persistent (DESIGN §3): the fixed configured TTL,
+	// rows in the shared web_sessions table, credential tags under a
+	// persistent random secret. A storage failure at startup disables
+	// sessions entirely instead of falling back to memory.
+	secret, err := resolveAdminSessionSecret(st)
+	if err != nil {
+		logger.Error("admin session storage unavailable; admin logins fail closed until restart", "err", err)
+		p.sessions = disabledSessions{reason: err}
+	} else {
+		p.sessSecret = secret
+		p.sessions = newSQLiteSessions(st, ttl, logger)
 	}
 	p.loginPage, _ = webFS.ReadFile("web/login.html")
 	p.appPage, _ = webFS.ReadFile("web/app.html")
 	p.relayPage, _ = webFS.ReadFile("web/relay.html")
+	p.homePage, _ = webFS.ReadFile("web/home.html")
 	return p
+}
+
+// SetWorkspaceHandler installs the /files API handler (agentapi's
+// WorkspaceHandler, DESIGN §5.1). Until one is installed, every /files API
+// request fails closed; the static public shells never need it.
+func (p *Portal) SetWorkspaceHandler(h http.Handler) {
+	p.workspaceMu.Lock()
+	defer p.workspaceMu.Unlock()
+	p.workspaceHandle = h
+}
+
+// workspaceHandler returns the installed /files API handler, if any.
+func (p *Portal) workspaceHandler() http.Handler {
+	p.workspaceMu.RLock()
+	defer p.workspaceMu.RUnlock()
+	return p.workspaceHandle
+}
+
+// sessionCredTag derives the credential tag of the current admin password;
+// empty when session storage is unavailable (no session can exist then).
+func (p *Portal) sessionCredTag() string {
+	if len(p.sessSecret) == 0 {
+		return ""
+	}
+	return adminCredentialTag(p.sessSecret, p.cfg.Password)
+}
+
+// cookieSecure decides the Secure attribute of session cookies: direct TLS,
+// or an explicitly configured https public_base_url (the only trusted
+// signals — X-Forwarded-Proto and the OpenList public URL are never
+// trusted, DESIGN §4).
+func (p *Portal) cookieSecure(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	if p.st == nil {
+		return false
+	}
+	v, ok := p.st.GetSetting("public_base_url")
+	if !ok {
+		return false
+	}
+	u, err := url.Parse(strings.TrimSpace(v))
+	return err == nil && u.Scheme == "https" && u.Host != ""
 }
 
 // StartCleanup launches the session expiry goroutines.
@@ -162,19 +235,14 @@ func (p *Portal) storeSnapshotCache(snap []openlist.StorageInfo) {
 	p.storageMu.Unlock()
 }
 
-// Wrap serves the public file workspace and relay shells alongside /admin.
-// File operations still require an API key; /admin keeps its session login.
+// Wrap serves the public navigation page, the file workspace shells and the
+// relay page alongside /admin. File operations require a workspace session
+// (or API key on the machine data plane); /admin keeps its session login.
 func (p *Portal) Wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/":
-			if r.Method != http.MethodGet {
-				respondMethodNotAllowed(w, http.MethodGet)
-				return
-			}
-			w.Header().Set("Cache-Control", "no-store")
-			w.Header().Set("Referrer-Policy", "no-referrer")
-			http.Redirect(w, r, "/files/", http.StatusFound)
+			p.serveHome(w, r)
 		case r.URL.Path == "/files" || strings.HasPrefix(r.URL.Path, "/files/"):
 			p.serveFiles(w, r)
 		case r.URL.Path == "/admin" || strings.HasPrefix(r.URL.Path, "/admin/"):
@@ -185,6 +253,31 @@ func (p *Portal) Wrap(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 		}
 	})
+}
+
+// homeCSP is the content security policy of the public navigation page: a
+// static same-origin document that only loads its own assets and links to
+// the file workspace and admin portal.
+const homeCSP = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+
+// serveHome serves the public navigation page (GET only, no credentials, no
+// cookies — DESIGN §2). The page file is frontend-owned; until web/home.html
+// ships the route answers 404.
+func (p *Portal) serveHome(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respondMethodNotAllowed(w, http.MethodGet)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Security-Policy", homeCSP)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
+	if len(p.homePage) == 0 {
+		respondError(w, http.StatusNotFound, "home page not installed")
+		return
+	}
+	serveHTML(w, http.StatusOK, p.homePage)
 }
 
 // relayCSP is the content security policy of the public relay page: a static
@@ -253,6 +346,11 @@ func (p *Portal) serve(w http.ResponseWriter, r *http.Request) {
 			respondMethodNotAllowed(w, http.MethodGet)
 			return
 		}
+		// An already-valid session goes straight to the portal (DESIGN §5.2).
+		if token := p.sessionToken(r); p.sessions.Validate(token, p.sessionCredTag()) {
+			http.Redirect(w, r, "/admin/", http.StatusFound)
+			return
+		}
 		serveHTML(w, http.StatusOK, p.loginPage)
 
 	case pathName == "/admin/api/login":
@@ -267,7 +365,7 @@ func (p *Portal) serve(w http.ResponseWriter, r *http.Request) {
 
 	default:
 		token := p.sessionToken(r)
-		if !p.sessions.Validate(token) {
+		if !p.sessions.Validate(token, p.sessionCredTag()) {
 			if strings.HasPrefix(pathName, "/admin/api/") {
 				respondError(w, http.StatusUnauthorized, "unauthorized")
 			} else {
@@ -333,7 +431,7 @@ func (p *Portal) serveAuthorized(w http.ResponseWriter, r *http.Request, token s
 			respondMethodNotAllowed(w, http.MethodPost)
 			return
 		}
-		p.handleLogout(w, token)
+		p.handleLogout(w, r, token)
 
 	case pathName == "/admin/api/connect/handoff":
 		if r.Method != http.MethodPost {
@@ -452,26 +550,45 @@ func (p *Portal) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.logins.reset(ip)
-	token, err := p.sessions.Create()
+	token, err := p.sessions.Create(p.sessionCredTag())
 	if err != nil {
 		p.log.Error("session create failed", "err", err)
 		respondError(w, http.StatusInternalServerError, "failed to create session")
 		return
 	}
-	ttl := int(p.cfg.SessionTTL.Standard().Seconds())
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    token,
 		Path:     "/admin",
-		MaxAge:   ttl,
+		MaxAge:   int(p.sessionTTL().Seconds()),
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
+		Secure:   p.cookieSecure(r),
 	})
 	respondJSON(w, http.StatusOK, map[string]any{"code": http.StatusOK, "message": "success"})
 }
 
-func (p *Portal) handleLogout(w http.ResponseWriter, token string) {
-	p.sessions.Delete(token)
+// sessionTTL is the fixed admin session lifetime: the configured
+// admin.session_ttl (default 24h), never extended (DESIGN §3).
+func (p *Portal) sessionTTL() time.Duration {
+	if ttl := p.cfg.SessionTTL.Standard(); ttl > 0 {
+		return ttl
+	}
+	return config.DefaultSessionTTL
+}
+
+// handleLogout revokes the persistent session. A storage failure is reported
+// as a server error and the cookie is kept: claiming success would pretend a
+// revocation that never happened (DESIGN §3). Without a cookie there is
+// nothing to revoke — clearing is honest.
+func (p *Portal) handleLogout(w http.ResponseWriter, r *http.Request, token string) {
+	if token != "" {
+		if err := p.sessions.Delete(token); err != nil {
+			p.log.Error("admin logout failed", "err", err)
+			respondError(w, http.StatusInternalServerError, "logout failed: the session could not be revoked, try again")
+			return
+		}
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    "",
@@ -479,6 +596,7 @@ func (p *Portal) handleLogout(w http.ResponseWriter, token string) {
 		MaxAge:   -1,
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
+		Secure:   p.cookieSecure(r),
 	})
 	respondJSON(w, http.StatusOK, map[string]any{"code": http.StatusOK, "message": "success"})
 }

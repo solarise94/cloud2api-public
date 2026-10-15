@@ -270,25 +270,24 @@ func (s *Server) handleLinkDownload(w http.ResponseWriter, r *http.Request, toke
 	}
 	q := url.Values{}
 	q.Set("sign", sign)
-	u := url.URL{Path: "/p" + internal, RawQuery: q.Encode()}
+	u := url.URL{Path: "/d" + internal, RawQuery: q.Encode()}
 	hdr := http.Header{}
 	for _, h := range []string{"Range", "If-None-Match", "If-Modified-Since", "If-Range"} {
 		if v := r.Header.Get(h); v != "" {
 			hdr.Set(h, v)
 		}
 	}
-	req, err := s.client.NewRequest(ctx, http.MethodGet, u, nil, 0, hdr)
-	if err != nil {
-		failUpstream(rec, c, "upstream request failed")
-		return
-	}
-	resp, err := s.client.DoAutoHeal(req)
+	// DoDownload follows OpenList's /d direct-link 302 server-side so the
+	// upstream URL stays behind the same-origin /l/{token} endpoint; failures
+	// keep the generic message (a transport error would embed the redirect
+	// target).
+	resp, err := s.client.DoDownload(ctx, http.MethodGet, u, hdr)
 	if err != nil {
 		failUpstream(rec, c, "upstream request failed")
 		return
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
+	if downloadRedirect(resp.StatusCode) || resp.StatusCode >= 400 {
 		failUpstream(rec, c, "upstream returned "+resp.Status)
 		return
 	}

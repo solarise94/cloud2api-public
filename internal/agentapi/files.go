@@ -446,27 +446,32 @@ func (s *Server) handleDownload(c *call) {
 		}
 	}
 
-	q := c.r.URL.Query()
+	// Query whitelist: only the server-fetched sign travels upstream, plus
+	// the caller's own `type` selector when one was supplied. A client-provided
+	// key, path or any other query parameter is never forwarded to OpenList.
+	q := url.Values{}
 	q.Set("sign", sign)
-	u := url.URL{Path: "/p" + internal, RawQuery: q.Encode()}
+	if t := c.r.URL.Query().Get("type"); t != "" {
+		q.Set("type", t)
+	}
+	u := url.URL{Path: "/d" + internal, RawQuery: q.Encode()}
 	hdr := http.Header{}
 	for _, h := range []string{"Range", "If-None-Match", "If-Modified-Since", "If-Range", "Accept"} {
 		if v := c.r.Header.Get(h); v != "" {
 			hdr.Set(h, v)
 		}
 	}
-	req, err := s.client.NewRequest(ctx, http.MethodGet, u, nil, 0, hdr)
+	// DoDownload fetches /d and follows OpenList's direct-link 302
+	// server-side; the upstream URL never reaches the client and transport
+	// failures answer with a generic message (err.Error could embed the
+	// redirect target).
+	resp, err := s.client.DoDownload(ctx, http.MethodGet, u, hdr)
 	if err != nil {
-		c.fail(errUpstream("failed to build download request"))
-		return
-	}
-	resp, err := s.client.DoAutoHeal(req)
-	if err != nil {
-		c.fail(errUpstream(err.Error()))
+		c.fail(errUpstream("download upstream request failed"))
 		return
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
+	if downloadRedirect(resp.StatusCode) || resp.StatusCode >= 400 {
 		c.fail(errUpstream("download upstream returned " + resp.Status))
 		return
 	}

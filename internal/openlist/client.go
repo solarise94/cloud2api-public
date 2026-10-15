@@ -8,6 +8,10 @@
 // permanent settings token via /api/admin/setting/get?key=token, swap it in
 // atomically and retry the failed request once (v0.3.1, fixes the 48h JWT
 // expiry of login tokens).
+//
+// Raw downloads use DoDownload (download.go): GET/HEAD with manual, validated
+// redirects and no envelope inspection — a downloaded file's JSON content
+// must never be mistaken for a token rejection.
 package openlist
 
 import (
@@ -173,6 +177,13 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 // permanent settings token and retries the request exactly once. Callers
 // with non-replayable (streaming) bodies must use Do instead; for those
 // requests the rejection is returned as-is.
+//
+// DoAutoHeal is for OpenList JSON API envelope calls only — never for raw
+// download payloads: the {"code":401} envelope inspection below would
+// misread a downloaded file whose content merely contains that byte
+// sequence as a token rejection, buffering the stream and triggering a bogus
+// re-login. Download traffic must go through DoDownload (download.go), which
+// heals on a real HTTP 401 from the initial trusted request only.
 //
 // OpenList signals an invalidated token either as HTTP 401 or — as observed
 // on the live instance — as HTTP 200 with an error envelope {"code":401}.

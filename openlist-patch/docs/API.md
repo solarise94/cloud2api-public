@@ -1,3 +1,5 @@
+[简体中文](API.md) | [English](API.en.md)
+
 # connect 模块接口
 
 带补丁的 OpenList 在自己的 HTTP 服务上增加以下接口。约定与 OpenList 一致：HTTP 状态恒为 200，响应体为 `{code, message, data}`，`code` 为 200 表示成功；失败时 `message` 是可直接展示的中文说明，`data.error_code` 是下表中的机器可读代码。

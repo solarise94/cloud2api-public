@@ -27,7 +27,7 @@ import (
 	"cloud2api/internal/store"
 )
 
-// ---- fake OpenList (fs API + admin storage list + /p downloads) ----
+// ---- fake OpenList (fs API + admin storage list + /d downloads) ----
 
 type fakeEntry struct {
 	name     string
@@ -66,7 +66,7 @@ type fakeOL struct {
 	storages []fakeStorage
 	nextSID  int64 // id allocator for storages added by a test
 
-	// fsCalls records every /api/fs/* and /p/* path the fake served, for the
+	// fsCalls records every /api/fs/* and /d/* path the fake served, for the
 	// "no file access after a storage swap" assertions.
 	fsCalls []string
 
@@ -95,12 +95,29 @@ type fakeOL struct {
 	taskDelay  time.Duration // how long tasks stay running
 	olRequests []string      // captured api paths
 
-	// pTruncateTo, when >= 0, makes the /p download endpoint send only that
+	// pTruncateTo, when >= 0, makes the /d download endpoint send only that
 	// many body bytes (simulating a truncated or short upstream). With
 	// pChunked the response omits Content-Length (chunked); otherwise the full
 	// Content-Length is declared and the handled short-writes.
 	pTruncateTo int
 	pChunked    bool
+
+	// dRedirect makes the /d download endpoint answer a 302 to a direct-link
+	// URL (served at /direct/...) instead of proxying the bytes, mirroring a
+	// storage without MustProxy. DoDownload must follow it server-side.
+	dRedirect bool
+
+	// pHits counts requests the fake answered on the restricted /p download
+	// route; every cloud2api flow must leave it at zero.
+	pHits int
+
+	// directHits counts /direct/* requests served (the 302 targets of a
+	// dRedirect /d), proving the helper followed the redirect server-side.
+	directHits int
+
+	// dQueries records the raw query string of every /d request, for the
+	// upstream query whitelist assertions.
+	dQueries []string
 }
 
 type fakeTask struct {
@@ -242,7 +259,7 @@ func (f *fakeOL) handler() http.Handler {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		f.olRequests = append(f.olRequests, r.URL.Path)
-		if strings.HasPrefix(r.URL.Path, "/api/fs/") || strings.HasPrefix(r.URL.Path, "/p/") {
+		if strings.HasPrefix(r.URL.Path, "/api/fs/") || strings.HasPrefix(r.URL.Path, "/d/") {
 			f.fsCalls = append(f.fsCalls, r.URL.Path)
 			f.fsHeaders = append(f.fsHeaders, r.Header.Clone())
 		}
@@ -432,44 +449,55 @@ func (f *fakeOL) handler() http.Handler {
 			}
 			writeOL(w, 200, "success", nil)
 		case strings.HasPrefix(r.URL.Path, "/p/") && r.Method == http.MethodGet:
-			p := path.Clean(strings.TrimPrefix(r.URL.Path, "/p"))
+			// A storage can reject /p while permitting /d redirects.
+			// Match that production failure without requiring a real drive.
+			f.pHits++
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"code":403,"message":"proxy download is disabled"}`))
+
+		case strings.HasPrefix(r.URL.Path, "/d/") && r.Method == http.MethodGet:
+			// /d is sign-gated like the live instance: only the server-fetched
+			// sign (plus a whitelisted type selector) may appear.
+			f.dQueries = append(f.dQueries, r.URL.RawQuery)
+			if r.URL.Query().Get("sign") != "sig:0" {
+				w.Header().Set("Content-Type", "text/plain")
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = w.Write([]byte("invalid or missing sign"))
+				return
+			}
+			for k := range r.URL.Query() {
+				if k != "sign" && k != "type" {
+					w.Header().Set("Content-Type", "text/plain")
+					w.WriteHeader(http.StatusForbidden)
+					_, _ = w.Write([]byte("unexpected query parameter " + k))
+					return
+				}
+			}
+			p := path.Clean(strings.TrimPrefix(r.URL.Path, "/d"))
 			e, ok := f.entries[p]
 			if !ok {
 				writeOL(w, 500, "object not found", nil)
 				return
 			}
-			w.Header().Set("Content-Type", "application/octet-stream")
-			w.Header().Set("Accept-Ranges", "bytes")
-			status := http.StatusOK
-			body := e.content
-			if rng := r.Header.Get("Range"); rng != "" {
-				if start, end, ok := parseFakeRange(rng, int64(len(e.content))); ok {
-					body = e.content[start : end+1]
-					status = http.StatusPartialContent
-					w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(e.content)))
-				} else {
-					w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", len(e.content)))
-					w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
-					return
-				}
+			if f.dRedirect {
+				// A storage without MustProxy: /d answers a 302 to the
+				// direct link, which DoDownload follows server-side.
+				http.Redirect(w, r, "/direct"+p, http.StatusFound)
+				return
 			}
-			n := len(body)
-			if f.pTruncateTo >= 0 && f.pTruncateTo < n {
-				n = f.pTruncateTo
+			f.serveDownloadBody(w, r, e)
+
+		case strings.HasPrefix(r.URL.Path, "/direct/") && r.Method == http.MethodGet:
+			// The direct-link target of a /d 302.
+			f.directHits++
+			p := path.Clean(strings.TrimPrefix(r.URL.Path, "/direct"))
+			e, ok := f.entries[p]
+			if !ok {
+				http.Error(w, "gone", http.StatusNotFound)
+				return
 			}
-			// A truncated upstream still declares the true length (the short
-			// write is the failure being simulated); chunked mode omits
-			// Content-Length and flushes so the framing is genuinely chunked.
-			if !f.pChunked {
-				w.Header().Set("Content-Length", strconv.Itoa(len(body)))
-			}
-			w.WriteHeader(status)
-			if f.pChunked {
-				if fl, ok := w.(http.Flusher); ok {
-					fl.Flush()
-				}
-			}
-			w.Write(body[:n])
+			f.serveDownloadBody(w, r, e)
 
 		// ---- task-backed operations (Phase 1b) ----
 
@@ -538,6 +566,51 @@ func (st fakeStorage) statusText() string {
 		return "work"
 	}
 	return st.status
+}
+
+// serveDownloadBody streams one fake entry with the range/truncation/chunked
+// semantics shared by the fake's /d (proxy) and /direct (redirect target)
+// download endpoints.
+func (f *fakeOL) serveDownloadBody(w http.ResponseWriter, r *http.Request, e *fakeEntry) {
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Accept-Ranges", "bytes")
+	// Simulated revalidation hit: any If-None-Match outside a Range request
+	// answers a 304 carrying the entity tag.
+	if r.Header.Get("If-None-Match") != "" && r.Header.Get("Range") == "" {
+		w.Header().Set("ETag", `"fake-etag"`)
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	status := http.StatusOK
+	body := e.content
+	if rng := r.Header.Get("Range"); rng != "" {
+		if start, end, ok := parseFakeRange(rng, int64(len(e.content))); ok {
+			body = e.content[start : end+1]
+			status = http.StatusPartialContent
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(e.content)))
+		} else {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", len(e.content)))
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+	}
+	n := len(body)
+	if f.pTruncateTo >= 0 && f.pTruncateTo < n {
+		n = f.pTruncateTo
+	}
+	// A truncated upstream still declares the true length (the short
+	// write is the failure being simulated); chunked mode omits
+	// Content-Length and flushes so the framing is genuinely chunked.
+	if !f.pChunked {
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	}
+	w.WriteHeader(status)
+	if f.pChunked {
+		if fl, ok := w.(http.Flusher); ok {
+			fl.Flush()
+		}
+	}
+	w.Write(body[:n])
 }
 
 func (f *fakeOL) submitTask(kind, srcDir, dstDir string, names []string, url string) *fakeTask {
@@ -618,8 +691,8 @@ func (t *fakeTask) view() map[string]any {
 	}
 }
 
-// parseFakeRange parses a single "bytes=a-b" client range for the fake /p
-// endpoint (open-ended "-b"/"a-" forms supported).
+// parseFakeRange parses a single "bytes=a-b" client range for the fake /d
+// download endpoint (open-ended "-b"/"a-" forms supported).
 func parseFakeRange(h string, size int64) (int64, int64, bool) {
 	spec, ok := strings.CutPrefix(strings.TrimSpace(h), "bytes=")
 	if !ok || strings.Contains(spec, ",") {

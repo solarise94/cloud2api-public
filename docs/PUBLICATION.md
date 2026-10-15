@@ -1,3 +1,5 @@
+[简体中文](PUBLICATION.md) | [English](PUBLICATION.en.md)
+
 # 公开开发预览快照
 
 公开仓库：<https://github.com/solarise94/cloud2api-public>。
@@ -45,4 +47,4 @@ Go 与前端自动化测试使用隔离夹具，不在真实网盘上进行上�
 
 剪贴板兼容修复有自动化回归覆盖，但尚未完成独立 Chrome 的系统剪贴板端到端验收，不能把按钮显示“已复制”视为系统剪贴板的独立验证。
 
-当前公开内容是开发预览，不是完整生产加固或商业认证声明。cloud2api 核心尚未指定独立许可证；公开可见不等于授予复用或再分发许可。OpenList 派生部分按其 AGPL-3.0 声明处理，详见 [许可证说明](../README.md#许可证)。
+当前公开内容是开发预览，不是完整生产加固或商业认证声明。cloud2api 核心尚未指定独立许可证；公开可见不等于授予复用或再分发许可。OpenList 派生部分按其 AGPL-3.0 声明处理，详见 [OpenList 许可证文本](../openlist-patch/LICENSE)。

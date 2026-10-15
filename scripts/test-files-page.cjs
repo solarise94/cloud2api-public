@@ -142,6 +142,32 @@
  *       hint and selects #share-url for Ctrl+C; a body-level temp textarea behind
  *       the modal (the old bug) copies nothing (mutation-proof); stale late
  *       clipboard callbacks after dialog close / logout never mutate a new session
+ *   WS  persistent workspaces (production boot, cookie sessions):
+ *       WS1 single valid entry auto-restores via history.replaceState into
+ *       /files/w/<id>/ and /me rides the workspace adapter with
+ *       X-C2A-Workspace:1 + credentials same-origin (never apikey/omit);
+ *       WS2 multiple entries render a selectable list with 添加 Key and enter
+ *       only on an explicit click; WS3 zero entries show the key gate;
+ *       WS4 login POSTs {api_key} once to /files/api/login, clears the input
+ *       immediately, never persists the key, then /me via the adapter;
+ *       WS5 hostile server entry URLs (cross-origin, non-/files/w/, query,
+ *       id mismatch) are rejected before any navigation or /me;
+ *       WS6 a deep-linked dead entry answers 401 with a re-login bound to THAT
+ *       entry (login body carries workspace_id, another key cannot take over);
+ *       WS7 stale /me races between entries never cross-render;
+ *       WS8 logout POSTs ONLY the current workspace /api/logout then returns to
+ *       /files/ (list refetched); WS9 pagehide aborts requests but NEVER calls
+ *       logout; WS10 切换工作区 keeps the cookie (no logout) and re-lists;
+ *       WS11 malformed workspace entries are dropped; WS12 failed logout keeps
+ *       the session and says so; WS13 a single saved entry is only LISTED
+ *       (with 添加 Key) after an EXPLICIT switch / logout — auto-restoring one
+ *       entry is a boot(/files/)-only behavior — and a second key provisions
+ *       its own new entry; WS14 share copy under the PRODUCTION cookie session
+ *       (mode-independent authenticated guard): real-transport link POST via
+ *       the adapter + secure Clipboard API success, LAN execCommand fallback,
+ *       failed-copy manual hint, and stale copy isolation across dialog close
+ *       and logout/relogin; WS-mock mock mode never touches /files/api/*
+ *       and keeps zero real network with the in-memory key only
  *
  * Usage:
  *   node scripts/test-files-page.cjs             (full suite; exit 2 when
@@ -299,12 +325,82 @@ const QUERY_HOSTILE_NAME = 'a&b=c#d?e f%20g+h.txt';
 const TRAV_NAME = '..%2F..%2Fetc%20passwd.txt';
 const UNI_NAME = '文件 🌍（下載）.txt';
 
+/* ================= workspace adapter (production stub) =================
+ * Persistent-workspace contract (docs/DESIGN-persistent-workspaces.md §2):
+ * /files/w/<id>/api/v1/<suffix> answers exactly like /v1/<suffix>; the /files
+ * page API (login / workspaces / per-entry logout) is answered from w.prodDocs
+ * so frontend flows can be driven without any real server. */
+const FUTURE_LOGIN_ISO = new Date(Date.now() + 30 * 86400e3).toISOString();
+const WS_ENTRY = (id, days) => ({
+  id,
+  url: '/files/w/' + id + '/',
+  expires_at: new Date(Date.now() + (days == null ? 30 : days) * 86400e3).toISOString(),
+});
+function stripWsPath(p) {
+  const m = /^\/files\/w\/[^/]+\/api(\/v1\/.*)$/.exec(String(p));
+  return m ? m[1] : String(p);
+}
+function routeError(status, code, message) {
+  const e = new Error(message);
+  e.__status = status;
+  e.__body = { error: { code, message, status } };
+  return e;
+}
+/* Handle the /files page API (login / workspaces / per-entry logout).
+ * Returns undefined when the path is not one of these. */
+async function filesApiRoute(w, p, init) {
+  if (p === '/files/api/workspaces') {
+    return JSON.parse(JSON.stringify(w.prodDocs.workspaces || { workspaces: [] }));
+  }
+  if (p === '/files/api/login') {
+    let body = {};
+    try { body = JSON.parse(String((init && init.body) || '{}')); } catch (e) { body = {}; }
+    w.loginCalls.push(JSON.parse(JSON.stringify(body || {})));
+    if (w.prodDocs.loginFail) {
+      throw routeError(w.prodDocs.loginFail.status || 401, w.prodDocs.loginFail.code || 'unauthorized',
+        w.prodDocs.loginFail.message || 'login refused');
+    }
+    if (!body || typeof body.api_key !== 'string' || !body.api_key) {
+      throw routeError(400, 'invalid_request', 'field `api_key` is required');
+    }
+    if (w.prodDocs.loginKeys && body.api_key !== w.prodDocs.loginKeys) {
+      throw routeError(401, 'unauthorized', 'invalid api key');
+    }
+    if (w.prodDocs.loginDoc) return JSON.parse(JSON.stringify(w.prodDocs.loginDoc));
+    const id = w.prodDocs.wsId || 'w-prodmain01';
+    return { workspace_id: id, url: '/files/w/' + id + '/', expires_at: FUTURE_LOGIN_ISO };
+  }
+  const lo = /^\/files\/w\/([^/]+)\/api\/logout$/.exec(p);
+  if (lo && (init.method || '') === 'POST') {
+    w.prodDocs.logoutCount = (w.prodDocs.logoutCount || 0) + 1;
+    if (w.prodDocs.logoutFail === 'network') throw new Error('harness: logout network down');
+    if (w.prodDocs.logoutFail) {
+      throw routeError(w.prodDocs.logoutFail.status || 500, 'logout_failed', w.prodDocs.logoutFail.message || 'logout failed');
+    }
+    return { ok: true };
+  }
+  return undefined;
+}
+/* Workspace adapter session check: dead entries answer 401 (fail closed). */
+function assertWsAlive(w, urlPathname) {
+  const m = /^\/files\/w\/([^/]+)\/api\//.exec(String(urlPathname));
+  if (!m) return;
+  const dead = w.prodDocs.ws401 === true ||
+    (Array.isArray(w.prodDocs.ws401For) && w.prodDocs.ws401For.indexOf(m[1]) >= 0);
+  if (dead) throw routeError(401, 'unauthorized', 'workspace session is invalid or expired');
+}
+
 /* ======================= session (world) machinery ===================== */
 /* Elements pre-created to mirror files.html exactly (id, tag, initial
  * state, parent). files.js must work against THIS structure. */
 const HTML_TREE = [
   ['mock-banner', 'div', { hidden: true }, null],
+  ['ws-list', 'section', { hidden: true }, null],
+  ['ws-sub', 'p', { text: '正在恢复已保存的工作区…' }, 'ws-list'],
+  ['ws-grid', 'div', {}, 'ws-list'],
+  ['ws-add-key', 'button', { type: 'button', text: '添加 API Key' }, 'ws-list'],
   ['gate', 'section', {}, null],
+  ['gate-hint', 'p', { class: 'fx-hint', text: '输入访问密钥，查看已授权的网盘，上传和分享文件。' }, 'gate'],
   ['login-form', 'form', {}, 'gate'],
   ['key', 'input', { type: 'password' }, 'login-form'],
   ['key-toggle', 'button', { type: 'button' }, 'login-form'],
@@ -313,6 +409,7 @@ const HTML_TREE = [
   ['workspace', 'div', { hidden: true }, null],
   ['me-prefix', 'span', {}, 'workspace'],
   ['theme-toggle', 'button', { type: 'button' }, 'workspace'],
+  ['switch-ws', 'button', { type: 'button', text: '切换工作区' }, 'workspace'],
   ['logout', 'button', { type: 'button' }, 'workspace'],
   ['notice', 'p', { hidden: true }, 'workspace'],
   ['drives-home', 'section', {}, 'workspace'],
@@ -435,7 +532,20 @@ function createWorld(opts) {
     anchorLog: [],    // native <a download> clicks (same-origin ticket downloads)
     objectUrlLog: [], // URL.createObjectURL calls (must be ZERO for ticket downloads)
     listenersLost: [],
-    prodDocs: { listByPath: {}, uploads: [] },
+    prodDocs: {
+      listByPath: {}, uploads: [],
+      /* persistent-workspace contract (docs/DESIGN-persistent-workspaces.md §2) */
+      workspaces: { workspaces: [] }, // GET /files/api/workspaces payload
+      loginDoc: null,    // full override of the login response (hostile shapes)
+      loginFail: null,   // {status, code, message} to refuse a login
+      loginKeys: null,   // when set, only this api_key is accepted
+      wsId: 'w-prodmain01',
+      ws401: false,      // every workspace api/v1 answer 401
+      ws401For: null,    // array of entry ids that answer 401
+      logoutFail: null,  // 'network' | {status, message}
+      logoutCount: 0,
+    },
+    loginCalls: [],   // bodies handed to POST /files/api/login
     upReceipts: [],   // FIFO of receipts (doc, deferred or {throw}) for PUT
     expectedPath: null, // fallback request slot when calls are not peekable
   };
@@ -711,9 +821,10 @@ function createWorld(opts) {
   /* ---------- browser globals ---------- */
   const winListeners = {};
   const docListeners = [];
+  const bootPathname = opts.pathname || '/files/';
   const locationObj = {
-    origin: 'http://127.0.0.1:18893', pathname: '/files/',
-    search, href: 'http://127.0.0.1:18893/files/' + search,
+    origin: 'http://127.0.0.1:18893', pathname: bootPathname,
+    search, href: 'http://127.0.0.1:18893' + bootPathname + search,
     assign(u) { w.urlLog.push({ kind: 'assign', url: String(u) }); },
     replace(u) { w.urlLog.push({ kind: 'replace', url: String(u) }); },
   };
@@ -871,13 +982,15 @@ function createWorld(opts) {
     global.fetch = () => { throw new Error('REAL NETWORK FETCH in mock mode'); };
     global.XMLHttpRequest = function () { throw new Error('REAL XHR in mock mode'); };
   } else {
-    /* production boot: recording fetch + XHR answering from fixtures */
+    /* production boot: recording fetch + XHR answering from fixtures. The route
+     * is invoked one microtask late (like a real response) so per-test fixtures
+     * assigned right after createWorld land before the boot traffic. */
     global.fetch = async function (url, init) {
       init = init || {};
       const entry = { url: String(url), init, at: vnow };
       w.fetchLog.push(entry);
       let doc, status = 200, netErr = null;
-      try { doc = await w.prodRoute(String(url), init, entry); }
+      try { doc = await Promise.resolve().then(() => w.prodRoute(String(url), init, entry)); }
       catch (e) {
         if (e && e.__status) { status = e.__status; doc = e.__body; }
         else { netErr = e; }
@@ -927,17 +1040,20 @@ function createWorld(opts) {
       }
     }
     global.XMLHttpRequest = XHRStub;
-    /* default production router: fixtures keyed like the /v1 surface */
-    w.prodRoute = async function (url) {
+    /* default production router: fixtures keyed like the /v1 surface, plus the
+     * persistent-workspace page API and the /files/w/<id>/api/v1 adapter */
+    w.prodRoute = async function (url, init) {
       const u = new URL(url, 'http://127.0.0.1:18893');
-      const p = u.pathname;
-      const err = (status, code, message) => { const e = new Error(message); e.__status = status; e.__body = { error: { code, message } }; return e; };
+      const handled = await filesApiRoute(w, u.pathname, init);
+      if (handled !== undefined) return handled;
+      assertWsAlive(w, u.pathname);
+      const p = stripWsPath(u.pathname);
       if (p === '/v1/me') return w.prodDocs.me || meDoc();
       let m = /^\/v1\/drives\/([^/]+)\/list$/.exec(p);
       if (m) {
         const path = u.searchParams.get('path') || '/';
         const doc = (w.prodDocs.listByPath[m[1]] || {})[path] || (w.prodDocs.listByPath[m[1]] || {})['*'];
-        if (!doc) throw err(404, 'not_found', 'prod stub: no fixture for ' + p + '?path=' + path);
+        if (!doc) throw routeError(404, 'not_found', 'prod stub: no fixture for ' + p + '?path=' + path);
         return doc;
       }
       if (p === '/v1/links') return { url: 'http://127.0.0.1:18893/l/prodtok', expires_at: '2026-10-21T00:00:00Z' };
@@ -947,7 +1063,7 @@ function createWorld(opts) {
         if (m[2] === 'move') return { from: '/x', to: '/y' };
         return { results: [] };
       }
-      throw err(404, 'not_found', 'prod stub: unmatched ' + p);
+      throw routeError(404, 'not_found', 'prod stub: unmatched ' + p);
       function init_json() { return null; }
     };
   }
@@ -1246,7 +1362,47 @@ async function login(w, key) {
 }
 async function logout(w) {
   fire(w.E('logout'), 'click');
+  /* production logout scrubs in-page first, then returns to /files/ (gate or
+   * list); mock logout goes straight to the gate. */
+  await pumpUntil(() => w.E('gate').hidden === false || w.E('ws-list').hidden === false, 20000, 'logout');
   await w.settle();
+}
+/* ---- persistent-workspace (production) helpers ---- */
+/* Workspace entry card lookup: dataset first, then text. */
+function wsCard(w, id) {
+  const byData = findAllW(w, w.E('ws-grid'), (el) =>
+    el.dataset && (el.dataset.wsId === id || el.dataset.ws === id));
+  if (byData.length) return byData[0];
+  const cands = findAllW(w, w.E('ws-grid'), (el) => w.textOf(el).includes(id));
+  return cands[cands.length - 1] || null;
+}
+/* Click a workspace entry's 进入 control and wait for the workspace UI. */
+async function enterWsEntry(w, id) {
+  const card = wsCard(w, id);
+  if (!card) throw new Error('workspace card not found for ' + id);
+  const go = findControls(w, card, ['进入'], { armedOnly: true })[0];
+  fire(go || card, 'click');
+  await pumpUntil(() => w.E('workspace').hidden === false, 20000, 'enter workspace ' + id);
+}
+function prodLogoutPosts(w) {
+  return (w.fetchLog || []).filter((f) =>
+    f.init && f.init.method === 'POST' &&
+    /^\/files\/w\/[^/]+\/api\/logout$/.test(String(f.url).split('?')[0]));
+}
+function prodLoginPosts(w) {
+  return (w.fetchLog || []).filter((f) =>
+    f.init && f.init.method === 'POST' && String(f.url) === '/files/api/login');
+}
+function prodMeFetches(w, id) {
+  return (w.fetchLog || []).filter((f) =>
+    String(f.url).indexOf('/files/w/' + id + '/api/v1/me') === 0);
+}
+function prodWorkspacesFetches(w) {
+  return (w.fetchLog || []).filter((f) => String(f.url) === '/files/api/workspaces');
+}
+/* The fetch/XHR record of every workspace-adapter data request. */
+function prodDataUrls(w) {
+  return (w.fetchLog || []).map((f) => f.url).concat((w.xhrLog || []).map((x) => x.url));
 }
 /* Log in and, if the landing rule did NOT auto-enter a browser, assert/return
  * the selector landing. Auto-entry only happens for exactly ONE granted drive;
@@ -1617,11 +1773,43 @@ async function main() {
   ok(/演示模式|模拟/.test(w.textOf(w.E('notice'))), 'F2d mock receipt is described as a simulation, got ' + JSON.stringify(w.textOf(w.E('notice'))));
   assertNoKeyLeak(w, 'F2d', ALL_KEYS);
 
+  /* F2d-key-smuggle: in MOCK mode the page still knows the session key, so a
+   * ticket that smuggles it (path or query) must be refused outright — the page
+   * must never hand key-bearing URLs to a download. (The production page holds
+   * no key at all, so this guard only exists where a key exists.) */
+  {
+    const prevTicket = w.mock.map['POST /v1/drives/fx-alpha/download-ticket'];
+    const anchorBefore = w.anchorLog.length;
+    installOverrides(w, {
+      'POST /v1/drives/fx-alpha/download-ticket': async () => ({
+        url: '/download/tok' + KEY_MAIN, expires_at: new Date(Date.now() + 120000).toISOString(),
+      }),
+    });
+    fire(mockDlBtn(), 'click');
+    await w.settle();
+    ok(w.anchorLog.length === anchorBefore, 'F2d a mock ticket smuggling the session key in its token path starts no download');
+    ok(/凭证无效|无效|过期/.test(w.textOf(w.E('notice'))),
+      'F2d the key-smuggling ticket is refused with an explanation, got ' + JSON.stringify(w.textOf(w.E('notice'))));
+    installOverrides(w, {
+      'POST /v1/drives/fx-alpha/download-ticket': async () => ({
+        url: '/download/tok?k=' + KEY_MAIN, expires_at: new Date(Date.now() + 120000).toISOString(),
+      }),
+    });
+    fire(mockDlBtn(), 'click');
+    await w.settle();
+    ok(w.anchorLog.length === anchorBefore, 'F2d a mock ticket smuggling the session key in a query starts no download');
+    /* restore the scripted ticket handler for later sections */
+    installOverrides(w, { 'POST /v1/drives/fx-alpha/download-ticket': prevTicket });
+    assertNoKeyLeak(w, 'F2d-key-smuggle', ALL_KEYS);
+  }
+
   /* A directory row has NO download control (directories are not downloadable). */
   const docsDlRow = fileRow(w, 'docs');
   const dirDl = findControls(w, docsDlRow, ['下载'], { armedOnly: true });
   ok(dirDl.length === 0, 'F2d a directory row offers no download control');
-  ok(ticketCalls(w).length === mockTicketsBefore + 1, 'F2d no extra ticket is requested for a directory');
+  const ticketsBeforeDir = ticketCalls(w).length;
+  fire(w.E('theme-toggle'), 'click'); // unrelated UI action in between
+  ok(ticketCalls(w).length === ticketsBeforeDir, 'F2d no extra ticket is requested for a directory');
   await backToDrives(w);
 
   /* ---- F3: readonly drive — destructive/upload affordances inert ---- */
@@ -2517,6 +2705,9 @@ async function main() {
   /* ---- F17: key hygiene (mock session) ---- */
   section('F17 key hygiene');
   assertNoKeyLeak(w, 'F17', ALL_KEYS);
+  ok(callsWhere(w, (r) => String(r.path).indexOf('/files/api') === 0 || String(r.path).indexOf('/files/w/') === 0).length === 0,
+    'WS-mock mock mode never calls the cookie workspace API (zero real network, no fabricated sessions)');
+  ok(w.E('switch-ws').hidden === true, 'WS-mock the workspace switch control is hidden in mock mode');
   ok(w.urlLog.length === 0 || !w.urlLog.some((u) => ALL_KEYS.some((k) => u.url.includes(k))), 'F17 key never written to any URL/navigation');
   ok(w.confirmLog.length === 0 || !w.confirmLog.some((c) => ALL_KEYS.some((k) => c.includes(k))), 'F17 key never surfaces via native dialogs');
   const mockPuts = callsWhere(w, (r) => r.method === 'PUT');
@@ -2934,19 +3125,38 @@ async function main() {
   };
   const prodList = async function (url) {
     const u = new URL(url, 'http://x');
-    const drive = decodeURIComponent(u.pathname.split('/')[3]);
+    const drive = decodeURIComponent(stripWsPath(u.pathname).split('/')[3]);
     const p = u.searchParams.get('path') || '/';
     return (wp.prodDocs.listByPath[drive] || {})[p] || listDoc('/', []);
   };
   ok(wp.E('mock-banner').hidden === true, 'F19 mock banner hidden outside ?mock=1');
+  /* boot first restores the cookie workspace list (default stub: none) → gate */
+  await pumpUntil(() => wp.E('gate').hidden === false, 20000, 'F19 boot gate after empty restore');
+  ok(prodWorkspacesFetches(wp).length === 1, 'F19 boot asked GET /files/api/workspaces exactly once');
+  ok(wp.E('ws-list').hidden === true, 'F19 zero saved entries go straight to the key gate');
   wp.E('key').value = KEY_PROD;
   fire(wp.E('login-form'), 'submit');
+  /* the raw key must leave the input immediately, before any response */
+  ok(String(wp.E('key').value) === '', 'F19 login clears the key input synchronously (page never retains it)');
   await pumpUntil(() => wp.E('workspace').hidden === false, 20000, 'F19 prod login');
-  const meFetch = wp.fetchLog.find((f) => f.url.indexOf('/v1/me') === 0);
-  ok(!!meFetch, 'F19 login probed /v1/me over fetch');
-  ok(meFetch && meFetch.init.credentials === 'omit', 'F19 fetch uses credentials:"omit", got ' + JSON.stringify(meFetch && meFetch.init.credentials));
-  ok(meFetch && String(meFetch.init.headers && meFetch.init.headers.apikey) === KEY_PROD, 'F19 apikey header carries the key');
+  const WS_ID = 'w-prodmain01';
+  const loginPost = prodLoginPosts(wp)[0];
+  ok(!!loginPost, 'F19 login POSTed /files/api/login');
+  let loginBody = null;
+  try { loginBody = JSON.parse(String(loginPost.init.body)); } catch (e) { /* not json */ }
+  ok(loginBody && loginBody.api_key === KEY_PROD && loginBody.workspace_id === undefined,
+    'F19 login body is exactly {api_key} (no key anywhere else), got ' + JSON.stringify(loginBody));
+  ok(loginPost.init.credentials === 'same-origin' && String(loginPost.init.headers && loginPost.init.headers['X-C2A-Workspace']) === '1',
+    'F19 login request is same-origin with the X-C2A-Workspace header, got ' + JSON.stringify(loginPost.init.credentials) + '/' + JSON.stringify(loginPost.init.headers));
+  ok(!loginPost.init.headers || !loginPost.init.headers.apikey, 'F19 no apikey header on the login request');
+  const meFetch = prodMeFetches(wp, WS_ID)[0];
+  ok(!!meFetch, 'F19 after login /me rides the workspace adapter /files/w/<id>/api/v1/me');
+  ok(meFetch && meFetch.init.credentials === 'same-origin', 'F19 fetch uses credentials:"same-origin", got ' + JSON.stringify(meFetch && meFetch.init.credentials));
+  ok(meFetch && String(meFetch.init.headers && meFetch.init.headers['X-C2A-Workspace']) === '1', 'F19 X-C2A-Workspace:1 header on the workspace /me');
+  ok(meFetch && !(meFetch.init.headers && meFetch.init.headers.apikey), 'F19 no apikey/Authorization long-term key header on /me');
   ok(meFetch && !meFetch.url.includes(KEY_PROD), 'F19 key never rides in the URL');
+  ok(wp.urlLog.some((u) => u.kind === 'replaceState' && u.url === '/files/w/' + WS_ID + '/'),
+    'F19 login replaceState navigates to the returned entry /files/w/<id>/, got ' + JSON.stringify(wp.urlLog));
   /* enter drive → encoded list request */
   await enterDrive(wp, 'fx-alpha');
   await pumpUntil(() => !!fileRow(wp, 'docs'), 20000, 'F19 root listing');
@@ -2954,33 +3164,42 @@ async function main() {
   const docsBtnP = findAllW(wp, docsRowP, (el) => String(el.className).includes('fx-namebtn') || (el.tagName === 'button' && wp.textOf(el).includes('docs')))[0];
   fire(docsBtnP || docsRowP, 'click');
   await pumpUntil(() => wp.textOf(wp.E('file-list')).includes('pd.txt'), 20000, 'F19 list /docs');
-  const listFetch = wp.fetchLog.filter((f) => f.url.indexOf('/v1/drives/fx-alpha/list') === 0).pop();
-  ok(listFetch.init.credentials === 'omit' && String(listFetch.init.headers.apikey) === KEY_PROD, 'F19 list keeps credentials omit + apikey header');
+  const listFetch = wp.fetchLog.filter((f) => stripWsPath(String(f.url).split('?')[0]) === '/v1/drives/fx-alpha/list').pop();
+  ok(listFetch.init.credentials === 'same-origin' && String(listFetch.init.headers['X-C2A-Workspace']) === '1' && !(listFetch.init.headers.apikey),
+    'F19 list keeps credentials same-origin + X-C2A-Workspace and never an apikey header');
   ok(listFetch.url.includes(encodeURIComponent('/docs')), 'F19 list path query is percent-encoded, got ' + listFetch.url);
+  ok(prodDataUrls(wp).every((u) => String(u).indexOf('/files/w/' + WS_ID + '/api/v1/') === 0 || String(u) === '/files/api/login' || String(u) === '/files/api/workspaces'),
+    'F19 every data request stays inside the current entry adapter, got ' + JSON.stringify(prodDataUrls(wp)));
 
-  /* F19b: non-empty upload → raw PUT body (positive length), apikey header */
+  /* F19b: non-empty upload → raw PUT body (positive length), cookie session */
   const heldResolve = { fn: null };
   const held = new Promise((r) => { heldResolve.fn = r; });
   wp.prodRoute = async function (url, init) {
     const u = new URL(url, 'http://x');
-    if (u.pathname === '/v1/drives/fx-alpha/files' && (init.method || '') === 'PUT') return held;
-    if (u.pathname === '/v1/me') return wp.prodDocs.me;
-    if (u.pathname.indexOf('/list') >= 0) return prodList(url);
-    throw Object.assign(new Error('prod 404 ' + url), { __status: 404, __body: { error: { code: 'not_found', message: 'prod stub' } } });
+    const handled = await filesApiRoute(wp, u.pathname, init);
+    if (handled !== undefined) return handled;
+    assertWsAlive(wp, u.pathname);
+    const p = stripWsPath(u.pathname);
+    if (p === '/v1/drives/fx-alpha/files' && (init.method || '') === 'PUT') return held;
+    if (p === '/v1/me') return wp.prodDocs.me;
+    if (p.indexOf('/list') >= 0) return prodList(url);
+    throw routeError(404, 'not_found', 'prod stub ' + url);
   };
   await queueUpload(wp, [fakeFile('up-raw.bin', 1024)]);
   await wp.settle();
   const rawXhr = wp.xhrLog.filter((x) => x.sent && x.method === 'PUT').pop();
   const rawFetchUp = wp.fetchLog.filter((f) => f.init.method === 'PUT').pop();
   if (rawXhr) {
-    ok(rawXhr.url.indexOf('/v1/drives/fx-alpha/files') === 0 && rawXhr.url.includes(encodeURIComponent('/docs/up-raw.bin')), 'F19b raw PUT url encodes drive+path, got ' + rawXhr.url);
-    ok(String(rawXhr.headers.apikey) === KEY_PROD, 'F19b XHR carries the apikey header');
-    ok(rawXhr.withCredentials === false, 'F19b upload XHR sets withCredentials=false (no ambient credentials)');
+    ok(stripWsPath(String(rawXhr.url).split('?')[0]) === '/v1/drives/fx-alpha/files' && rawXhr.url.includes(encodeURIComponent('/docs/up-raw.bin')), 'F19b raw PUT url rides the entry adapter and encodes drive+path, got ' + rawXhr.url);
+    ok(!rawXhr.headers.apikey, 'F19b upload XHR carries NO apikey long-term key header');
+    ok(String(rawXhr.headers['x-c2a-workspace']) === '1', 'F19b upload XHR carries X-C2A-Workspace:1');
+    ok(rawXhr.withCredentials === true, 'F19b upload XHR is credentialed (same-origin session Cookie), got ' + rawXhr.withCredentials);
     ok(String(rawXhr.headers['idempotency-key'] || '').length > 0, 'F19b XHR carries an Idempotency-Key');
     ok(String(rawXhr.headers['content-type']) === 'application/octet-stream', 'F19b non-empty raw PUT sets octet-stream, got ' + String(rawXhr.headers['content-type']));
     ok(!(rawXhr.body instanceof global.FormData), 'F19b non-empty file uses a RAW body, not multipart');
     const rawLen = rawXhr.body && (rawXhr.body.size != null ? rawXhr.body.size : (rawXhr.body.byteLength != null ? rawXhr.body.byteLength : (rawXhr.body.length != null ? rawXhr.body.length : -1)));
     ok(rawLen === 1024, 'F19b raw body length is positive and exact (' + rawLen + ')');
+    ok(!String(rawXhr.url).includes(KEY_PROD), 'F19b the key never appears in the upload URL');
     /* 100% progress must NOT complete the task */
     rawXhr.__progress(1024, 1024);
     await wp.settle();
@@ -2991,7 +3210,7 @@ async function main() {
     stp = taskState(wp, 'up-raw.bin');
     ok(stp.found && stp.done, 'F19b valid upstream receipt completes the task, got: ' + JSON.stringify(stp.text));
   } else if (rawFetchUp) {
-    ok(String(rawFetchUp.init.headers.apikey) === KEY_PROD && rawFetchUp.init.credentials === 'omit', 'F19b fetch upload keeps apikey + credentials omit');
+    ok(!(rawFetchUp.init.headers && rawFetchUp.init.headers.apikey) && rawFetchUp.init.credentials === 'same-origin', 'F19b fetch upload keeps same-origin credentials and no apikey header');
     const b = rawFetchUp.init.body;
     ok(!(b instanceof global.FormData) && b && (b.size === 1024 || b.byteLength === 1024), 'F19b fetch upload carries the raw 1024-byte body');
     heldResolve.fn(uploadReceipt('/docs/up-raw.bin', 1024));
@@ -3005,10 +3224,14 @@ async function main() {
   const zeroPromise = new Promise((r) => { zeroHeld.fn = r; });
   wp.prodRoute = async function (url, init) {
     const u = new URL(url, 'http://x');
-    if (u.pathname === '/v1/drives/fx-alpha/files' && (init.method || '') === 'PUT') return zeroPromise;
-    if (u.pathname === '/v1/me') return wp.prodDocs.me;
-    if (u.pathname.indexOf('/list') >= 0) return prodList(url);
-    throw Object.assign(new Error('prod 404 ' + url), { __status: 404, __body: { error: { code: 'not_found', message: 'prod stub' } } });
+    const handled = await filesApiRoute(wp, u.pathname, init);
+    if (handled !== undefined) return handled;
+    assertWsAlive(wp, u.pathname);
+    const p = stripWsPath(u.pathname);
+    if (p === '/v1/drives/fx-alpha/files' && (init.method || '') === 'PUT') return zeroPromise;
+    if (p === '/v1/me') return wp.prodDocs.me;
+    if (p.indexOf('/list') >= 0) return prodList(url);
+    throw routeError(404, 'not_found', 'prod stub ' + url);
   };
   await queueUpload(wp, [fakeFile('up-zero.bin', 0)]);
   await wp.settle();
@@ -3017,7 +3240,7 @@ async function main() {
   if (zeroXhr) {
     ok(zeroXhr.body instanceof global.FormData, 'F19c zero-byte upload uses multipart FormData, got ' + (zeroXhr.body && zeroXhr.body.constructor && zeroXhr.body.constructor.name));
     ok(zeroXhr.body.has('file'), 'F19c multipart body carries the `file` part');
-    ok(String(zeroXhr.headers.apikey) === KEY_PROD, 'F19c zero upload keeps the apikey header');
+    ok(!zeroXhr.headers.apikey && String(zeroXhr.headers['x-c2a-workspace']) === '1', 'F19c zero upload authenticates via the workspace cookie header, no apikey');
     zeroXhr.__respond(200, JSON.stringify(uploadReceipt('/docs/up-zero.bin', 0)));
     await wp.settle();
   } else if (zeroFetchAny) {
@@ -3035,10 +3258,14 @@ async function main() {
   const badPromise = new Promise((r) => { badXhrHold.fn = r; });
   wp.prodRoute = async function (url, init) {
     const u = new URL(url, 'http://x');
-    if (u.pathname === '/v1/drives/fx-alpha/files' && (init.method || '') === 'PUT') return badPromise;
-    if (u.pathname === '/v1/me') return wp.prodDocs.me;
-    if (u.pathname.indexOf('/list') >= 0) return prodList(url);
-    throw Object.assign(new Error('prod 404 ' + url), { __status: 404, __body: { error: { code: 'not_found', message: 'prod stub' } } });
+    const handled = await filesApiRoute(wp, u.pathname, init);
+    if (handled !== undefined) return handled;
+    assertWsAlive(wp, u.pathname);
+    const p = stripWsPath(u.pathname);
+    if (p === '/v1/drives/fx-alpha/files' && (init.method || '') === 'PUT') return badPromise;
+    if (p === '/v1/me') return wp.prodDocs.me;
+    if (p.indexOf('/list') >= 0) return prodList(url);
+    throw routeError(404, 'not_found', 'prod stub ' + url);
   };
   await queueUpload(wp, [fakeFile('up-bad.bin', 5)]);
   await wp.settle();
@@ -3059,10 +3286,14 @@ async function main() {
   const cancelPromise = new Promise((r) => { cancelHold.fn = r; });
   wp.prodRoute = async function (url, init) {
     const u = new URL(url, 'http://x');
-    if (u.pathname === '/v1/drives/fx-alpha/files' && (init.method || '') === 'PUT') return cancelPromise;
-    if (u.pathname === '/v1/me') return wp.prodDocs.me;
-    if (u.pathname.indexOf('/list') >= 0) return prodList(url);
-    throw Object.assign(new Error('prod 404 ' + url), { __status: 404, __body: { error: { code: 'not_found', message: 'prod stub' } } });
+    const handled = await filesApiRoute(wp, u.pathname, init);
+    if (handled !== undefined) return handled;
+    assertWsAlive(wp, u.pathname);
+    const p = stripWsPath(u.pathname);
+    if (p === '/v1/drives/fx-alpha/files' && (init.method || '') === 'PUT') return cancelPromise;
+    if (p === '/v1/me') return wp.prodDocs.me;
+    if (p.indexOf('/list') >= 0) return prodList(url);
+    throw routeError(404, 'not_found', 'prod stub ' + url);
   };
   await queueUpload(wp, [fakeFile('up-cancel.bin', 5)]);
   await wp.settle();
@@ -3089,19 +3320,23 @@ async function main() {
   let prodTicketCount = 0;
   wp.prodRoute = async function (url, init) {
     const u = new URL(url, 'http://x');
-    if (u.pathname === '/v1/drives/fx-alpha/download-ticket' && (init.method || '') === 'POST') {
+    const handled = await filesApiRoute(wp, u.pathname, init);
+    if (handled !== undefined) return handled;
+    assertWsAlive(wp, u.pathname);
+    const p = stripWsPath(u.pathname);
+    if (p === '/v1/drives/fx-alpha/download-ticket' && (init.method || '') === 'POST') {
       prodTicketCount++;
       if (typeof ticketDoc === 'function') return ticketDoc(init);
       if (ticketDoc) return ticketDoc;
-      throw Object.assign(new Error('no ticket fixture'), { __status: 500, __body: { error: { code: 'harness', message: 'no ticket fixture' } } });
+      throw routeError(500, 'harness', 'no ticket fixture');
     }
-    if (u.pathname === '/v1/drives/fx-alpha/files' && (init.method || 'GET') !== 'PUT') {
+    if (p === '/v1/drives/fx-alpha/files' && (init.method || 'GET') !== 'PUT') {
       dlBytesHits++; // the removed streaming download path
       return { __raw: true, status: 200, text: 'PD-BYTES', headers: {} };
     }
-    if (u.pathname === '/v1/me') return wp.prodDocs.me;
-    if (u.pathname.indexOf('/list') >= 0) return prodList(url);
-    throw Object.assign(new Error('prod 404 ' + url), { __status: 404, __body: { error: { code: 'not_found', message: 'prod stub' } } });
+    if (p === '/v1/me') return wp.prodDocs.me;
+    if (p.indexOf('/list') >= 0) return prodList(url);
+    throw routeError(404, 'not_found', 'prod stub ' + url);
   };
   const FUTURE = new Date(Date.now() + 120000).toISOString();
   const okTicket = () => ({ url: '/download/AbC123_-token', expires_at: FUTURE });
@@ -3129,8 +3364,9 @@ async function main() {
   const prodTickets = prodTicketFetches(wp);
   ok(prodTickets.length === 1, 'F19g exactly one download-ticket POST, got ' + prodTickets.length);
   const tk = prodTickets[0];
-  ok(tk && tk.init.credentials === 'omit' && String(tk.init.headers && tk.init.headers.apikey) === KEY_PROD,
-    'F19g ticket POST keeps credentials omit + apikey header');
+  ok(tk && tk.init.credentials === 'same-origin' && !(tk.init.headers && tk.init.headers.apikey),
+    'F19g ticket POST keeps same-origin credentials and never an apikey header, got ' + JSON.stringify(tk && tk.init.credentials));
+  ok(tk && String(tk.init.headers && tk.init.headers['X-C2A-Workspace']) === '1', 'F19g ticket POST carries X-C2A-Workspace:1');
   ok(tk && !tk.url.includes(KEY_PROD), 'F19g ticket request URL never carries the key');
   let tBody = null;
   try { tBody = JSON.parse(String(tk && tk.init.body)); } catch (e) { /* not json */ }
@@ -3161,12 +3397,16 @@ async function main() {
     ['same-origin with fragment', { url: '/download/tok#frag', expires_at: FUTURE }],
     ['extra path segment', { url: '/download/tok/extra', expires_at: FUTURE }],
     ['traversal escaping /download/', { url: '/download/../files/tok', expires_at: FUTURE }],
+    ['percent-encoding in the token', { url: '/download/tok%2Fkey', expires_at: FUTURE }],
+    ['dot segment in the token', { url: '/download/..%2Ftok', expires_at: FUTURE }],
     ['expired expiry', { url: '/download/tok', expires_at: new Date(Date.now() - 1000).toISOString() }],
     ['non-string expiry', { url: '/download/tok', expires_at: 12345 }],
     ['missing url', { expires_at: FUTURE }],
-    /* a ticket URL that smuggles the API key must be refused outright */
-    ['key embedded in the URL', { url: '/download/tok' + KEY_PROD, expires_at: FUTURE }],
+    /* a ticket URL that smuggles key material in a query must be refused */
     ['key in the URL query', { url: '/download/tok?k=' + KEY_PROD, expires_at: FUTURE }],
+    /* NOTE: "key embedded in the token path" is exercised in the MOCK session
+     * (F2d-key-smuggle) where the page still knows the session key; the
+     * production page never holds a key, so it cannot leak one into an href. */
   ];
   for (const [label, doc] of hostileTickets) {
     ticketDoc = () => doc;
@@ -3248,8 +3488,9 @@ async function main() {
   resetDl();
   const lateBase = prodTicketCount;
   fire(dlBtn(), 'click');
-  await pumpUntil(() => prodTicketCount > lateBase, 20000, 'F19g late ticket in flight');
+  /* downloadItem shows the preparing notice synchronously before the request */
   const dlPendingNotice = wp.textOf(wp.E('notice'));
+  await pumpUntil(() => prodTicketCount > lateBase, 20000, 'F19g late ticket in flight');
   await wp.settle();
   ok(/正在准备下载/.test(dlPendingNotice), 'F19g late-ticket case: request is in flight, got ' + JSON.stringify(dlPendingNotice));
   await logout(wp);
@@ -3280,16 +3521,21 @@ async function main() {
   section('F19 production 401');
   wp.prodRoute = async function (url) {
     const u = new URL(url, 'http://x');
-    if (u.pathname.indexOf('/list') >= 0) {
-      throw Object.assign(new Error('401'), { __status: 401, __body: { error: { code: 'unauthorized', message: 'PROD-401-SENTINEL' } } });
+    const handled = await filesApiRoute(wp, u.pathname, {});
+    if (handled !== undefined) return handled;
+    const p = stripWsPath(u.pathname);
+    if (p.indexOf('/list') >= 0) {
+      throw routeError(401, 'unauthorized', 'PROD-401-SENTINEL');
     }
-    if (u.pathname === '/v1/me') return wp.prodDocs.me;
-    throw Object.assign(new Error('prod 404 ' + url), { __status: 404, __body: { error: { code: 'not_found', message: 'prod stub' } } });
+    if (p === '/v1/me') return wp.prodDocs.me;
+    throw routeError(404, 'not_found', 'prod stub ' + url);
   };
   fire(wp.E('refresh-btn'), 'click');
   await pumpUntil(() => wp.E('gate').hidden === false, 20000, 'F19f prod 401 gate');
   ok(wp.E('workspace').hidden === true, 'F19f workspace hidden after production 401');
   ok(/401|失效|吊销/.test(wp.textOf(wp.E('gate-err'))), 'F19f production 401 explained, got: ' + JSON.stringify(wp.textOf(wp.E('gate-err'))));
+  ok(String(wp.E('gate-hint').textContent).includes('重新登录') && String(wp.E('gate-hint').textContent).includes('工作区'),
+    'F19f the 401 gate is bound to THIS entry for re-login, got: ' + JSON.stringify(wp.E('gate-hint').textContent));
 
   /* F20: pagehide invalidates the session for in-flight uploads */
   section('F20 pagehide invalidation');
@@ -3299,10 +3545,14 @@ async function main() {
   const phPromise = new Promise((r) => { phHold.fn = r; });
   wp.prodRoute = async function (url, init) {
     const u = new URL(url, 'http://x');
-    if (u.pathname === '/v1/drives/fx-alpha/files' && (init.method || '') === 'PUT') return phPromise;
-    if (u.pathname === '/v1/me') return wp.prodDocs.me;
-    if (u.pathname.indexOf('/list') >= 0) return prodList(url);
-    throw Object.assign(new Error('prod 404 ' + url), { __status: 404, __body: { error: { code: 'not_found', message: 'prod stub' } } });
+    const handled = await filesApiRoute(wp, u.pathname, init);
+    if (handled !== undefined) return handled;
+    assertWsAlive(wp, u.pathname);
+    const p = stripWsPath(u.pathname);
+    if (p === '/v1/drives/fx-alpha/files' && (init.method || '') === 'PUT') return phPromise;
+    if (p === '/v1/me') return wp.prodDocs.me;
+    if (p.indexOf('/list') >= 0) return prodList(url);
+    throw routeError(404, 'not_found', 'prod stub ' + url);
   };
   wp.E('key').value = KEY_PROD;
   fire(wp.E('login-form'), 'submit');
@@ -3313,15 +3563,508 @@ async function main() {
   await wp.settle();
   const phXhr = wp.xhrLog.filter((x) => x.sent && x.method === 'PUT').pop();
   ok(!!phXhr && !phXhr.aborted, 'F20 upload in flight before pagehide');
+  const logoutPostsBeforePh = prodLogoutPosts(wp).length;
   wp.winFire('pagehide', {});
   await wp.settle();
   ok(phXhr.aborted === true, 'F20 pagehide aborts the in-flight upload request');
+  ok(prodLogoutPosts(wp).length === logoutPostsBeforePh,
+    'F20 pagehide NEVER POSTs a workspace logout (the cookie session must survive), got ' +
+    (prodLogoutPosts(wp).length - logoutPostsBeforePh) + ' new');
   /* even if a response still arrives, the dead session must not complete it */
   phXhr.__respond(200, JSON.stringify(uploadReceipt('/up-ph.bin', 5)));
   await wp.settle();
   const phState = taskState(wp, 'up-ph.bin');
   // the task must be gone from the queue OR present in a non-done state
   ok(!phState.found || !phState.done, 'F20 post-pagehide response never completes the task, got: ' + JSON.stringify(phState.found ? phState.text : '(task removed)'));
+
+  /* ================= Session 4: persistent workspace restore/logout ========
+   * Production-boot flows around the cookie workspace contract: restore,
+   * multi-entry list, hostile server URLs, per-entry re-login, switch and
+   * logout isolation. All via the recording fetch stub (zero real network). */
+  dropTimers();
+
+  /* ---- WS1: a single valid entry auto-restores ---- */
+  section('WS1 single valid entry auto-restores');
+  {
+    const wsr = createWorld({ production: true });
+    wsr.prodDocs.me = meDoc();
+    wsr.prodDocs.listByPath['fx-alpha'] = { '/': listDoc('/', [entry('restored.txt', false, 3)]) };
+    const wsOne = 'ws-single-01';
+    wsr.prodDocs.workspaces = { workspaces: [WS_ENTRY(wsOne)] };
+    await pumpUntil(() => wsr.E('workspace').hidden === false, 20000, 'WS1 auto-restore');
+    ok(wsr.E('gate').hidden === true && wsr.E('ws-list').hidden === true, 'WS1 a single entry never stops at the gate or the list');
+    ok(wsr.urlLog.some((u) => u.kind === 'replaceState' && u.url === '/files/w/' + wsOne + '/'),
+      'WS1 restore replaceState-navigates into /files/w/<id>/, got ' + JSON.stringify(wsr.urlLog));
+    ok(wsr.urlLog.every((u) => u.kind !== 'pushState'), 'WS1 restore does not push a new history entry');
+    ok(prodLoginPosts(wsr).length === 0, 'WS1 restore never POSTs a login (cookie only)');
+    const meF = prodMeFetches(wsr, wsOne)[0];
+    ok(!!meF, 'WS1 restore reads /me through the entry adapter');
+    ok(meF && meF.init.credentials === 'same-origin' && String(meF.init.headers['X-C2A-Workspace']) === '1' && !(meF.init.headers.apikey),
+      'WS1 restore /me is same-origin + X-C2A-Workspace:1 without any apikey header');
+    ok(wsr.textOf(wsr.E('me-prefix')).includes('fxmain'), 'WS1 the restored session shows the /me key prefix');
+    assertNoKeyLeak(wsr, 'WS1', ALL_KEYS);
+  }
+
+  /* ---- WS2: multiple entries render a selectable list + 添加 Key ---- */
+  section('WS2 multiple entries render a selectable list');
+  {
+    const wsm = createWorld({ production: true });
+    wsm.prodDocs.me = meDoc();
+    const idA = 'ws-entry-aaaa';
+    const idB = 'ws-entry-bbbb';
+    wsm.prodDocs.workspaces = { workspaces: [WS_ENTRY(idA), WS_ENTRY(idB)] };
+    await pumpUntil(() => wsm.E('ws-list').hidden === false && !!wsCard(wsm, idA) && !!wsCard(wsm, idB), 20000, 'WS2 list shown');
+    ok(wsm.E('gate').hidden === true && wsm.E('workspace').hidden === true, 'WS2 list boot shows neither gate nor workspace');
+    ok(!!wsCard(wsm, idA) && !!wsCard(wsm, idB), 'WS2 both entries render as cards');
+    ok(findControls(wsm, wsm.E('ws-grid'), ['进入'], { armedOnly: true }).length === 2, 'WS2 each entry offers an explicit 进入 control');
+    ok(prodMeFetches(wsm, idA).length === 0 && prodMeFetches(wsm, idB).length === 0, 'WS2 the list never auto-opens an entry');
+    ok(prodLoginPosts(wsm).length === 0, 'WS2 the list never auto-logins');
+    /* 添加 Key reveals the login form beside the list, touching nothing */
+    fire(wsm.E('ws-add-key'), 'click');
+    await wsm.settle();
+    ok(wsm.E('gate').hidden === false && wsm.E('ws-list').hidden === false, 'WS2 添加 API Key reveals the login form beside the list');
+    ok(prodLoginPosts(wsm).length === 0, 'WS2 revealing the form sends nothing');
+    /* explicit entry click → its own adapter */
+    await enterWsEntry(wsm, idB);
+    ok(wsm.urlLog.some((u) => u.kind === 'pushState' && u.url === '/files/w/' + idB + '/'),
+      'WS2 an explicit entry click navigates to its /files/w/<id>/');
+    ok(prodMeFetches(wsm, idB).length === 1 && prodMeFetches(wsm, idA).length === 0,
+      'WS2 /me targets exactly the chosen entry');
+    ok(wsm.textOf(wsm.E('me-prefix')).includes('fxmain'), 'WS2 the chosen entry opened the workspace');
+    assertNoKeyLeak(wsm, 'WS2', ALL_KEYS);
+  }
+
+  /* ---- WS3: restore failures fall back to the usable gate ---- */
+  section('WS3 restore failures fall back to the gate');
+  {
+    const wne = createWorld({ production: true });
+    wne.prodDocs.me = meDoc();
+    const baseRoute = wne.prodRoute;
+    wne.prodRoute = async (url, init) => {
+      if (String(url) === '/files/api/workspaces') throw new Error('restore network down');
+      return baseRoute(url, init);
+    };
+    await pumpUntil(() => wne.E('gate').hidden === false, 20000, 'WS3 network-error gate');
+    ok(wne.E('ws-list').hidden === true && wne.E('workspace').hidden === true, 'WS3 a failed restore shows only the gate');
+    ok(/网络错误|工作区/.test(wne.textOf(wne.E('gate-err'))),
+      'WS3 the restore failure is explained, got ' + JSON.stringify(wne.textOf(wne.E('gate-err'))));
+    /* the gate still allows a fresh login despite the restore failure */
+    wne.prodRoute = baseRoute;
+    wne.E('key').value = KEY_PROD;
+    fire(wne.E('login-form'), 'submit');
+    await pumpUntil(() => wne.E('workspace').hidden === false, 20000, 'WS3 login after failed restore');
+    ok(wne.E('workspace').hidden === false, 'WS3 login still works after a failed restore');
+  }
+
+  /* ---- WS4: failed logins keep the gate and explain ---- */
+  section('WS4 login failures stay at the gate');
+  {
+    const wlf = createWorld({ production: true });
+    wlf.prodDocs.me = meDoc();
+    wlf.prodDocs.loginFail = { status: 401, code: 'unauthorized', message: 'BAD-LOGIN-SENTINEL' };
+    await pumpUntil(() => wlf.E('gate').hidden === false, 20000, 'WS4 gate');
+    wlf.E('key').value = 'sk-c2a-wronglogin';
+    fire(wlf.E('login-form'), 'submit');
+    await wlf.settle();
+    ok(wlf.E('workspace').hidden === true && wlf.E('gate').hidden === false, 'WS4 a failed login stays at the gate');
+    ok(/BAD-LOGIN-SENTINEL|401|无效|吊销/.test(wlf.textOf(wlf.E('gate-err'))),
+      'WS4 the login failure is explained, got ' + JSON.stringify(wlf.textOf(wlf.E('gate-err'))));
+    ok(prodMeFetches(wlf, 'w-prodmain01').length === 0, 'WS4 a failed login issues no workspace /me');
+    ok(wlf.urlLog.every((u) => u.kind !== 'replaceState' && u.kind !== 'pushState'), 'WS4 a failed login never navigates');
+    /* the retry still works and the input is cleared on every attempt */
+    wlf.prodDocs.loginFail = null;
+    wlf.E('key').value = KEY_PROD;
+    fire(wlf.E('login-form'), 'submit');
+    ok(String(wlf.E('key').value) === '', 'WS4 the key input clears again on the retry');
+    await pumpUntil(() => wlf.E('workspace').hidden === false, 20000, 'WS4 retry login');
+    ok(wlf.E('workspace').hidden === false, 'WS4 the retry succeeds');
+  }
+
+  /* ---- WS5: hostile server entry URLs are rejected outright ---- */
+  section('WS5 hostile entry URLs from the server are rejected');
+  {
+    const idOk = 'ws-target-01';
+    const hostiles = [
+      ['cross-origin absolute', { workspace_id: idOk, url: 'https://evil.example/files/w/' + idOk + '/', expires_at: FUTURE_LOGIN_ISO }],
+      ['protocol-relative', { workspace_id: idOk, url: '//evil.example/files/w/' + idOk + '/', expires_at: FUTURE_LOGIN_ISO }],
+      ['admin path', { workspace_id: idOk, url: '/admin/', expires_at: FUTURE_LOGIN_ISO }],
+      ['non-entry path', { workspace_id: idOk, url: '/files/other/', expires_at: FUTURE_LOGIN_ISO }],
+      ['query smuggling', { workspace_id: idOk, url: '/files/w/' + idOk + '/?x=1', expires_at: FUTURE_LOGIN_ISO }],
+      ['fragment', { workspace_id: idOk, url: '/files/w/' + idOk + '/#f', expires_at: FUTURE_LOGIN_ISO }],
+      ['id/url mismatch', { workspace_id: idOk, url: '/files/w/ws-other-99/', expires_at: FUTURE_LOGIN_ISO }],
+      ['bad id chars', { workspace_id: 'ws/bad/id', url: '/files/w/ws/bad/id/', expires_at: FUTURE_LOGIN_ISO }],
+      ['traversal path', { workspace_id: idOk, url: '/files/w/../admin/', expires_at: FUTURE_LOGIN_ISO }],
+      ['missing url', { workspace_id: idOk, expires_at: FUTURE_LOGIN_ISO }],
+      ['javascript: url', { workspace_id: idOk, url: 'javascript:alert(1)', expires_at: FUTURE_LOGIN_ISO }],
+    ];
+    for (const [label, doc] of hostiles) {
+      dropTimers();
+      const wh = createWorld({ production: true });
+      wh.prodDocs.me = meDoc();
+      wh.prodDocs.loginDoc = doc;
+      await pumpUntil(() => wh.E('gate').hidden === false, 20000, 'WS5 gate ' + label);
+      wh.E('key').value = KEY_PROD;
+      fire(wh.E('login-form'), 'submit');
+      await wh.settle();
+      ok(wh.E('workspace').hidden === true, 'WS5 hostile entry (' + label + ') never opens a workspace');
+      ok(!wh.urlLog.some((u) => (u.kind === 'replaceState' || u.kind === 'pushState') && String(u.url).indexOf('/files/w/') === 0),
+        'WS5 hostile entry (' + label + ') never navigates, urlLog=' + JSON.stringify(wh.urlLog));
+      ok(wh.fetchLog.every((f) => !/^\/files\/w\/[^/]+\/api\/v1\//.test(String(f.url))),
+        'WS5 hostile entry (' + label + ') issues no workspace data requests');
+      ok(/不合法|拒绝/.test(wh.textOf(wh.E('gate-err'))),
+        'WS5 hostile entry (' + label + ') is explained, got ' + JSON.stringify(wh.textOf(wh.E('gate-err'))));
+    }
+  }
+
+  /* ---- WS6: a deep-linked dead entry re-logins into THAT entry ---- */
+  section('WS6 deep-linked dead entry re-logins into that entry');
+  {
+    const deadId = 'ws-dead-0001';
+    const wsd = createWorld({ production: true, pathname: '/files/w/' + deadId + '/' });
+    wsd.prodDocs.me = meDoc();
+    wsd.prodDocs.loginKeys = KEY_PROD;
+    wsd.prodDocs.wsId = deadId; // the re-login must return THIS entry
+    wsd.prodDocs.ws401For = [deadId];
+    await pumpUntil(() => wsd.E('gate').hidden === false, 20000, 'WS6 relogin gate');
+    ok(wsd.E('workspace').hidden === true && wsd.E('ws-list').hidden === true, 'WS6 a dead deep link shows only the gate');
+    const meDead = prodMeFetches(wsd, deadId);
+    ok(meDead.length === 1 && meDead[0].init.credentials === 'same-origin', 'WS6 the deep link probed /me through the entry adapter first');
+    const gateCtx = wsd.E('gate-hint').textContent + '\n' + wsd.textOf(wsd.E('gate-err'));
+    ok(/工作区/.test(gateCtx) && /失效|重新登录/.test(gateCtx),
+      'WS6 the gate names the dead workspace and asks for re-login, got ' + JSON.stringify(gateCtx));
+    /* re-login: the body MUST carry workspace_id so another key cannot take over */
+    wsd.E('key').value = KEY_PROD;
+    fire(wsd.E('login-form'), 'submit');
+    wsd.prodDocs.ws401For = null; // server accepted the matching key for this entry
+    await wsd.settle();
+    const relog = wsd.loginCalls[0];
+    ok(relog && relog.workspace_id === deadId && relog.api_key === KEY_PROD,
+      'WS6 the re-login POST carries the dead entry workspace_id, got ' + JSON.stringify(relog));
+    await pumpUntil(() => wsd.E('workspace').hidden === false, 20000, 'WS6 relogin enters');
+    ok(wsd.urlLog.some((u) => u.kind === 'replaceState' && u.url === '/files/w/' + deadId + '/'),
+      'WS6 the successful re-login lands on the same entry url');
+  }
+
+  /* ---- WS7: stale entry loads never cross-render ---- */
+  section('WS7 stale entry loads never cross-render');
+  {
+    const wst = createWorld({ production: true });
+    const idA = 'ws-stale-aaaa';
+    const idB = 'ws-stale-bbbb';
+    wst.prodDocs.workspaces = { workspaces: [WS_ENTRY(idA), WS_ENTRY(idB)] };
+    const meA = meDoc();
+    meA.key = { id: 'k-a', prefix: 'sk-c2a-entryA…', default_drive: null };
+    meA.drives = [{ id: 'fx-a-drive', provider: 'openlist', root: '/A', perms: ['list'], health: 'healthy' }];
+    const meBws = meB();
+    const holdA = { promise: null, resolve: null };
+    holdA.promise = new Promise((r) => { holdA.resolve = r; });
+    wst.prodRoute = async function (url, init) {
+      const u = new URL(url, 'http://x');
+      const handled = await filesApiRoute(wst, u.pathname, init);
+      if (handled !== undefined) return handled;
+      const mm = /^\/files\/w\/([^/]+)\/api\/v1\/me$/.exec(u.pathname);
+      if (mm) {
+        if (mm[1] === idA) return holdA.promise; // entry A stalls mid-air
+        if (mm[1] === idB) return meBws;
+        return meDoc();
+      }
+      throw routeError(404, 'not_found', 'WS7 stub ' + url);
+    };
+    await pumpUntil(() => wst.E('ws-list').hidden === false && !!wsCard(wst, idA) && !!wsCard(wst, idB), 20000, 'WS7 list');
+    /* click A (stalls), then switch to B while A is still pending */
+    const cardA = wsCard(wst, idA);
+    fire(findControls(wst, cardA, ['进入'], { armedOnly: true })[0], 'click');
+    await wst.settle();
+    ok(wst.E('workspace').hidden === true && /打开工作区/.test(wst.E('ws-sub').textContent),
+      'WS7 entry A stays pending with an opening notice');
+    const cardB = wsCard(wst, idB);
+    ok(!!cardB, 'WS7 the other entry stays clickable while A is pending');
+    fire(findControls(wst, cardB, ['进入'], { armedOnly: true })[0], 'click');
+    await pumpUntil(() => wst.E('workspace').hidden === false, 20000, 'WS7 entry B opens');
+    ok(wst.textOf(wst.E('me-prefix')).includes('fxsession'), 'WS7 entry B opened with its own /me');
+    holdA.resolve(meA); // A's stale response lands late
+    await wst.settle();
+    ok(wst.E('workspace').hidden === false && wst.textOf(wst.E('me-prefix')).includes('fxsession'),
+      'WS7 the late entry-A response never takes over the open entry-B session');
+    ok(prodMeFetches(wst, idA).length === 1 && prodMeFetches(wst, idB).length === 1,
+      'WS7 exactly one /me per entry was issued');
+    ok(wst.urlLog.some((u) => u.kind === 'pushState' && u.url === '/files/w/' + idB + '/'),
+      'WS7 the URL follows the winning entry');
+  }
+
+  /* ---- WS8: logout POSTs only the current entry, then /files/ ---- */
+  section('WS8 logout posts only the current workspace');
+  {
+    const wsl = createWorld({ production: true });
+    wsl.prodDocs.me = meDoc();
+    const idW = 'ws-logout-01';
+    wsl.prodDocs.workspaces = { workspaces: [WS_ENTRY(idW)] };
+    await pumpUntil(() => wsl.E('workspace').hidden === false, 20000, 'WS8 restore');
+    fire(wsl.E('logout'), 'click');
+    wsl.prodDocs.workspaces = { workspaces: [] }; // server removed the session
+    await pumpUntil(() => wsl.E('gate').hidden === false, 20000, 'WS8 logout done');
+    await wsl.settle();
+    const posts = prodLogoutPosts(wsl);
+    ok(posts.length === 1, 'WS8 exactly one logout POST, got ' + posts.length);
+    ok(posts[0] && new RegExp('^/files/w/' + idW + '/api/logout$').test(String(posts[0].url)),
+      'WS8 logout POST targets ONLY the current entry, got ' + (posts[0] && posts[0].url));
+    ok(posts[0] && posts[0].init.credentials === 'same-origin' &&
+      !(posts[0].init.headers && posts[0].init.headers.apikey) &&
+      String(posts[0].init.headers && posts[0].init.headers['X-C2A-Workspace']) === '1',
+      'WS8 the logout POST is same-origin with the workspace header and no apikey');
+    ok(wsl.urlLog.some((u) => u.kind === 'pushState' && u.url === '/files/'), 'WS8 after logout the page returns to /files/');
+    ok(prodWorkspacesFetches(wsl).length === 2, 'WS8 the list is refetched after logout, got ' + prodWorkspacesFetches(wsl).length);
+    ok(wsl.E('gate').hidden === false && wsl.E('workspace').hidden === true && wsl.E('ws-list').hidden === true,
+      'WS8 with the entry gone, /files/ shows only the key gate');
+  }
+
+  /* ---- WS10: 切换工作区 keeps the cookie session ---- */
+  section('WS10 switch workspace keeps the session');
+  {
+    const wsw = createWorld({ production: true });
+    wsw.prodDocs.me = meDoc();
+    const idS = 'ws-switch-01';
+    const idT = 'ws-switch-02';
+    wsw.prodDocs.workspaces = { workspaces: [WS_ENTRY(idS), WS_ENTRY(idT)] };
+    await pumpUntil(() => wsw.E('ws-list').hidden === false && !!wsCard(wsw, idS) && !!wsCard(wsw, idT), 20000, 'WS10 list');
+    await enterWsEntry(wsw, idS);
+    ok(wsw.E('workspace').hidden === false, 'WS10 entered the first workspace');
+    fire(wsw.E('switch-ws'), 'click');
+    await pumpUntil(() => wsw.E('ws-list').hidden === false && !!wsCard(wsw, idS) && !!wsCard(wsw, idT), 20000, 'WS10 back to list');
+    ok(prodLogoutPosts(wsw).length === 0, 'WS10 switching NEVER POSTs logout (the cookie session is kept)');
+    ok(wsw.urlLog.some((u) => u.kind === 'pushState' && u.url === '/files/'), 'WS10 switching returns to /files/');
+    ok(!!wsCard(wsw, idS) && !!wsCard(wsw, idT), 'WS10 both entries are still offered after switching');
+    await enterWsEntry(wsw, idT);
+    ok(prodMeFetches(wsw, idT).length === 1, 'WS10 the other entry opens through its own adapter');
+    ok(wsw.E('workspace').hidden === false, 'WS10 the other entry opened');
+  }
+
+  /* ---- WS11: the workspaces list is sanitized ---- */
+  section('WS11 workspace list sanitization');
+  {
+    const wsg = createWorld({ production: true });
+    wsg.prodDocs.me = meDoc();
+    const good1 = 'ws-good-0001';
+    const good2 = 'ws-good-0002';
+    wsg.prodDocs.workspaces = { workspaces: [
+      WS_ENTRY(good1),
+      WS_ENTRY(good2),
+      { id: 'bad/id', url: '/files/w/bad/id/', expires_at: FUTURE_LOGIN_ISO },
+      { id: 'ws-mismatch0', url: '/files/w/ws-other00/', expires_at: FUTURE_LOGIN_ISO },
+      { id: 'ws-absolute', url: 'https://evil.example/files/w/ws-absolute/', expires_at: FUTURE_LOGIN_ISO },
+      { id: 'short' },
+      'garbage',
+      null,
+    ] };
+    await pumpUntil(() => wsg.E('ws-list').hidden === false && findControls(wsg, wsg.E('ws-grid'), ['进入'], { armedOnly: true }).length === 2, 20000, 'WS11 list shown');
+    const cards = findControls(wsg, wsg.E('ws-grid'), ['进入'], { armedOnly: true });
+    ok(cards.length === 2 && !!wsCard(wsg, good1) && !!wsCard(wsg, good2),
+      'WS11 exactly the valid entries survive sanitization, got ' + cards.length);
+    /* all-invalid list falls back to the gate */
+    dropTimers();
+    const wsb = createWorld({ production: true });
+    wsb.prodDocs.workspaces = { workspaces: [{ id: 'nope' }, 'x', null] };
+    await pumpUntil(() => wsb.E('gate').hidden === false, 20000, 'WS11 all-invalid gate');
+    ok(wsb.E('ws-list').hidden === true && wsb.E('workspace').hidden === true,
+      'WS11 an all-invalid list falls back to the key gate');
+  }
+
+  /* ---- WS12: a failed logout returns to /files/ with the session intact ---- */
+  section('WS12 failed logout keeps the session');
+  {
+    const wsf = createWorld({ production: true });
+    wsf.prodDocs.me = meDoc();
+    const idF = 'ws-faillogo-1';
+    wsf.prodDocs.workspaces = { workspaces: [WS_ENTRY(idF)] };
+    await pumpUntil(() => wsf.E('workspace').hidden === false, 20000, 'WS12 restore');
+    const listsBefore = prodWorkspacesFetches(wsf).length;
+    wsf.prodDocs.logoutFail = 'network';
+    fire(wsf.E('logout'), 'click');
+    await wsf.settle();
+    ok(prodLogoutPosts(wsf).length === 1, 'WS12 the logout POST was attempted');
+    ok(prodWorkspacesFetches(wsf).length === listsBefore + 1, 'WS12 a failed logout still returns to /files/ to re-list');
+    await pumpUntil(() => wsf.E('ws-list').hidden === false && !!wsCard(wsf, idF), 20000, 'WS12 list after failed logout');
+    ok(wsf.E('workspace').hidden === true && wsf.E('gate').hidden === true,
+      'WS12 after a failed logout the still-valid entry is LISTED, never silently re-entered');
+    /* the still-valid entry stays selectable; from inside it the logout retry completes */
+    wsf.prodDocs.logoutFail = null;
+    await enterWsEntry(wsf, idF);
+    wsf.prodDocs.workspaces = { workspaces: [] }; // server removes the session this time
+    fire(wsf.E('logout'), 'click');
+    await pumpUntil(() => wsf.E('gate').hidden === false, 20000, 'WS12 retry logout');
+    await wsf.settle();
+    ok(prodLogoutPosts(wsf).length === 2, 'WS12 the re-entry retry POSTs logout again');
+    ok(wsf.E('gate').hidden === false, 'WS12 the completed logout lands on the gate');
+  }
+
+  /* ---- WS13: explicit switch never auto-restores a single entry ----
+   * THE regression behind "cannot add a second key": with exactly one saved
+   * workspace, 切换工作区 must land on the LIST + 添加 Key flow — the single-
+   * entry auto-restore is a BOOT(/files/)-only behavior. */
+  section('WS13 single-entry switch lists instead of auto-restoring');
+  {
+    const wss = createWorld({ production: true });
+    wss.prodDocs.me = meDoc();
+    const id1 = 'ws-onelisting';
+    const id2 = 'ws-secondkey';
+    wss.prodDocs.workspaces = { workspaces: [WS_ENTRY(id1)] };
+    await pumpUntil(() => wss.E('workspace').hidden === false, 20000, 'WS13 boot auto-restore');
+    ok(wss.E('workspace').hidden === false, 'WS13 boot with one entry still auto-restores');
+    /* explicit switch with the SAME single entry: must show the list + 添加 Key */
+    wss.prodDocs.workspaces = { workspaces: [WS_ENTRY(id1)] };
+    fire(wss.E('switch-ws'), 'click');
+    await pumpUntil(() => wss.E('ws-list').hidden === false && !!wsCard(wss, id1), 20000, 'WS13 list after switch');
+    ok(wss.E('workspace').hidden === true && wss.E('gate').hidden === true,
+      'WS13 explicit switch with a single entry shows the LIST, never auto-re-enters it');
+    ok(wss.urlLog.some((u) => u.kind === 'pushState' && u.url === '/files/'), 'WS13 the switch lands on /files/');
+    ok(prodLogoutPosts(wss).length === 0, 'WS13 switching never POSTs logout');
+    /* 添加 Key beside the list: a second key opens a NEW workspace */
+    fire(wss.E('ws-add-key'), 'click');
+    await wss.settle();
+    ok(wss.E('gate').hidden === false && wss.E('ws-list').hidden === false, 'WS13 添加 API Key reveals the login form beside the list');
+    wss.prodDocs.wsId = id2; // the next login provisions a new workspace entry
+    wss.E('key').value = 'sk-c2a-secondkey1';
+    fire(wss.E('login-form'), 'submit');
+    ok(String(wss.E('key').value) === '', 'WS13 the add-key input clears immediately');
+    await pumpUntil(() => wss.E('workspace').hidden === false, 20000, 'WS13 second key enters');
+    const addLogin = wss.loginCalls[0];
+    ok(addLogin && addLogin.api_key === 'sk-c2a-secondkey1' && addLogin.workspace_id === undefined,
+      'WS13 the add-key login posts a plain {api_key} (no workspace_id), got ' + JSON.stringify(addLogin));
+    ok(wss.urlLog.some((u) => u.kind === 'replaceState' && u.url === '/files/w/' + id2 + '/'),
+      'WS13 the second key lands on its own NEW entry, got ' + JSON.stringify(wss.urlLog));
+    /* switching again lists BOTH entries without auto-entry */
+    wss.prodDocs.workspaces = { workspaces: [WS_ENTRY(id1), WS_ENTRY(id2)] };
+    fire(wss.E('switch-ws'), 'click');
+    await pumpUntil(() => wss.E('ws-list').hidden === false && !!wsCard(wss, id1) && !!wsCard(wss, id2), 20000, 'WS13 both entries listed');
+    ok(wss.E('workspace').hidden === true && wss.E('gate').hidden === true,
+      'WS13 the two-entry list shows neither gate nor an auto-entered workspace');
+    ok(prodLogoutPosts(wss).length === 0, 'WS13 no logout happened anywhere in the flow');
+    /* the first entry is still selectable from the list */
+    const meId1Before = prodMeFetches(wss, id1).length;
+    await enterWsEntry(wss, id1);
+    ok(wss.E('workspace').hidden === false && prodMeFetches(wss, id1).length === meId1Before + 1,
+      'WS13 the original entry remains selectable from the list');
+    assertNoKeyLeak(wss, 'WS13', ALL_KEYS);
+  }
+
+  /* ---- WS14: share copy under the PRODUCTION cookie session ----
+   * P2 regression guard: copyText's authenticated check must be mode-
+   * independent (MOCK ? KEY : WS). With the old !!KEY guard the production
+   * page (which never holds a key) silently no-op'd every copy, and the
+   * mock-only F22 suite could not see it. */
+  section('WS14 production share copy, fallback and stale isolation');
+  async function prodShareReady(ww) {
+    ww.prodDocs.me = meDoc();
+    ww.prodDocs.listByPath['fx-alpha'] = { '/': listDoc('/', [entry('shareme.txt', false, 7)]) };
+    ww.prodDocs.workspaces = { workspaces: [WS_ENTRY('ws-copydemo1')] };
+    await pumpUntil(() => ww.E('workspace').hidden === false, 20000, 'WS14 restore');
+    await enterDrive(ww, 'fx-alpha');
+    await listed(ww, 'shareme.txt', 'WS14 listing');
+    fire(findControls(ww, fileRow(ww, 'shareme.txt'), ['分享'], { armedOnly: true })[0], 'click');
+    await ww.settle();
+    fire(ww.E('share-form'), 'submit');
+    await pumpUntil(() => ww.E('share-result').hidden === false, 20000, 'WS14 link generated');
+    await ww.settle();
+    return String(ww.E('share-url').value);
+  }
+  /* WS14a: secure Clipboard API success over the real transport */
+  {
+    const wcp = createWorld({ production: true });
+    const url = await prodShareReady(wcp);
+    const linkPost = (wcp.fetchLog || []).filter((f) =>
+      f.init.method === 'POST' && /\/api\/v1\/links$/.test(String(f.url).split('?')[0]));
+    ok(linkPost.length === 1 && String(linkPost[0].url).indexOf('/files/w/ws-copydemo1/api/v1/links') === 0,
+      'WS14 the share link POST rode the workspace adapter, got ' + JSON.stringify(linkPost.map((f) => f.url)));
+    ok(linkPost[0].init.credentials === 'same-origin' && !(linkPost[0].init.headers.apikey),
+      'WS14 the link POST is same-origin with no apikey header');
+    ok(url.includes('/l/prodtok') && wcp.E('share-result').hidden === false, 'WS14 production share URL rendered');
+    wcp.copiedLog.length = 0; wcp.clipboardLog.length = 0; wcp.execLog.length = 0;
+    fire(wcp.E('share-copy'), 'click');
+    await wcp.settle();
+    ok(writeTextCopies(wcp).some((c) => c.text === url),
+      'WS14 production copy puts the EXACT share URL on the clipboard, got ' + JSON.stringify(copiedTexts(wcp)));
+    ok(shareCopySaysCopied(wcp), 'WS14 production copy shows 已复制, got ' + JSON.stringify(shareCopyLabel(wcp)));
+    ok(!wcp.execLog.includes('copy'), 'WS14 no execCommand fallback when the async API works');
+    ok(wcp.textOf(wcp.E('share-err')).trim() === '', 'WS14 no inline error on a successful production copy');
+  }
+  /* WS14b: insecure-context legacy fallback still works in production */
+  {
+    const wfb = createWorld({ production: true, noClipboard: true, insecure: true });
+    const url = await prodShareReady(wfb);
+    wfb.copiedLog.length = 0; wfb.execLog.length = 0;
+    fire(wfb.E('share-copy'), 'click');
+    await wfb.settle();
+    const ex = execCopies(wfb);
+    ok(writeTextCopies(wfb).length === 0 && ex.length === 1 && ex[0].text === url,
+      'WS14 production LAN fallback copies the exact URL via execCommand, got ' + JSON.stringify(copiedTexts(wfb)));
+    ok(ex.length === 1 && ex[0].inDialog === true && ex[0].activeId === 'share-url',
+      'WS14 the legacy fallback selected #share-url INSIDE the modal, got ' + JSON.stringify(ex));
+    ok(shareCopySaysCopied(wfb), 'WS14 fallback success shows 已复制, got ' + JSON.stringify(shareCopyLabel(wfb)));
+  }
+  /* WS14c: a failing legacy copy claims no success and enables manual copy */
+  {
+    const wex = createWorld({ production: true, noClipboard: true, insecure: true, clipboard: { exec: false } });
+    const url = await prodShareReady(wex);
+    wex.copiedLog.length = 0;
+    fire(wex.E('share-copy'), 'click');
+    await wex.settle();
+    ok(copiedTexts(wex).length === 0, 'WS14 a failed production copy records nothing, got ' + JSON.stringify(copiedTexts(wex)));
+    ok(!shareCopySaysCopied(wex) && shareCopyLabel(wex) === '复制', 'WS14 no false 已复制, got ' + JSON.stringify(shareCopyLabel(wex)));
+    ok(/未能复制|手动|Ctrl\+C|选择/.test(wex.textOf(wex.E('share-err'))),
+      'WS14 a manual-copy hint is shown, got ' + JSON.stringify(wex.textOf(wex.E('share-err'))));
+    ok(wex.focusLog.some((f) => f.id === 'share-url' && f.op === 'select'),
+      'WS14 #share-url was selected for manual copy, focusLog=' + JSON.stringify(wex.focusLog.map((f) => f.id + ':' + f.op)));
+    ok(String(wex.E('share-url').value) === url, 'WS14 the URL stays intact for manual copying');
+  }
+  /* WS14d: stale production copies after dialog close / logout+relogin */
+  {
+    const wsc = createWorld({ production: true });
+    const url = await prodShareReady(wsc);
+    const holdA = holdClipboard(wsc);
+    fire(wsc.E('share-copy'), 'click');
+    await wsc.settle();
+    ok(wsc.clipboardLog.includes(url) && execCopies(wsc).length === 0,
+      'WS14 the held write was handed the URL; no fallback while it is pending');
+    closeShareDlg(wsc);
+    await wsc.settle();
+    ok(dialogIsClosed(wsc, 'dlg-share'), 'WS14 the dialog closed while the copy was pending');
+    holdA.resolve();
+    await wsc.settle();
+    releaseClipboard(wsc);
+    ok(shareCopyLabel(wsc) !== '已复制',
+      'WS14 a late copy success never marks the closed dialog 已复制, got ' + JSON.stringify(shareCopyLabel(wsc)));
+    /* logout/relogin isolation: the persistent entry is re-entered through the
+     * list (the real UI path — an explicit logout never auto-restores). */
+    const reenter = async () => {
+      await logout(wsc); // → /files/ list (single entry listed, not auto-entered)
+      await pumpUntil(() => wsc.E('ws-list').hidden === false && !!wsCard(wsc, 'ws-copydemo1'), 20000, 'WS14 relist');
+      await enterWsEntry(wsc, 'ws-copydemo1');
+      await enterDrive(wsc, 'fx-alpha');
+      await listed(wsc, 'shareme.txt', 'WS14 relisted');
+    };
+    await reenter();
+    await prodShareReady(wsc); // session 2: fresh share dialog with a result
+    const holdB = holdClipboard(wsc);
+    fire(wsc.E('share-copy'), 'click');
+    await wsc.settle();
+    await reenter(); // session 3 while session 2's write is still pending
+    fire(findControls(wsc, wsc.E('file-tbody'), ['分享'], { armedOnly: true })[0], 'click');
+    await wsc.settle();
+    fire(wsc.E('share-form'), 'submit');
+    await pumpUntil(() => wsc.E('share-result').hidden === false, 20000, 'WS14 session3 link');
+    await wsc.settle();
+    const labelBefore = shareCopyLabel(wsc);
+    ok(!shareCopySaysCopied(wsc), 'WS14 session 3 starts with a clean 复制 label');
+    holdB.resolve();
+    await wsc.settle();
+    releaseClipboard(wsc);
+    ok(!shareCopySaysCopied(wsc) && shareCopyLabel(wsc) === labelBefore,
+      'WS14 a stale production copy resolved after relogin never mutates the new session, got ' + JSON.stringify(shareCopyLabel(wsc)));
+    ok(wsc.textOf(wsc.E('share-err')).trim() === '', 'WS14 no stale copy error in the new session');
+    assertNoKeyLeak(wsc, 'WS14', ALL_KEYS);
+  }
+
+  dropTimers();
 
   /* production hygiene */
   assertNoKeyLeak(wp, 'F19', ALL_KEYS);

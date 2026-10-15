@@ -180,7 +180,7 @@ func (e *guardTestEnv) swapStorageA(t *testing.T) {
 	e.up.mu.Unlock()
 }
 
-// fsPathsUnder returns the data-plane (/api/fs/*, /p/*) requests whose body
+// fsPathsUnder returns the data-plane (/api/fs/*, /d/*) requests whose body
 // or path references a path under mount (path-boundary aware, so /d/a does
 // not match /d/a-renamed).
 func (e *guardTestEnv) fsPathsUnder(t *testing.T, mount string) []string {
@@ -189,7 +189,7 @@ func (e *guardTestEnv) fsPathsUnder(t *testing.T, mount string) []string {
 	defer e.up.mu.Unlock()
 	var out []string
 	for _, r := range e.up.reqs {
-		if !strings.HasPrefix(r.Path, "/api/fs/") && !strings.HasPrefix(r.Path, "/p/") {
+		if !strings.HasPrefix(r.Path, "/api/fs/") && !strings.HasPrefix(r.Path, "/d/") {
 			continue
 		}
 		blob := r.Path + " " + r.FilePath + " " + string(r.Body)

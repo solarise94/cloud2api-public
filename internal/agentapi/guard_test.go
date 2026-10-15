@@ -124,13 +124,15 @@ func (h *swapHarness) swapStorageA() {
 	h.fake.addStorage("/d/a", "Aliyun")
 }
 
-// fsUnderA counts the fs/p calls the fake served under /d/a.
+// fsUnderA counts the fs/p calls the fake served under /d/a: fs API calls
+// whose recorded body path falls under the mount, plus /d downloads of the
+// internal /d/a namespace.
 func (h *swapHarness) fsUnderA() int {
 	h.fake.mu.Lock()
 	defer h.fake.mu.Unlock()
 	n := 0
 	for _, p := range h.fake.fsCalls {
-		if strings.HasPrefix(p, "/d/a/") || strings.HasPrefix(p, "/p/d/a") {
+		if strings.HasPrefix(p, "/d/a/") || strings.HasPrefix(p, "/d/d/a/") || strings.HasPrefix(p, "/p/d/a") {
 			n++
 		}
 	}

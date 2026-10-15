@@ -344,22 +344,18 @@ func (s *Server) handleTicketDownload(w http.ResponseWriter, r *http.Request, to
 	}
 	q := url.Values{}
 	q.Set("sign", sign)
-	u := url.URL{Path: "/p" + internal, RawQuery: q.Encode()}
+	u := url.URL{Path: "/d" + internal, RawQuery: q.Encode()}
 	hdr := http.Header{}
 	for _, h := range []string{"Range", "If-None-Match", "If-Modified-Since", "If-Range", "Accept"} {
 		if v := r.Header.Get(h); v != "" {
 			hdr.Set(h, v)
 		}
 	}
-	req, err := s.client.NewRequest(ctx, http.MethodGet, u, nil, 0, hdr)
-	if err != nil {
-		e := errUpstream("upstream request failed")
-		c.errMsg = e.Code + ": " + e.Message
-		e.withDocs(c.base)
-		writeJSON(rec, e.status, map[string]any{"error": e})
-		return
-	}
-	resp, err := s.client.DoAutoHeal(req)
+	// DoDownload fetches /d and follows OpenList's direct-link 302
+	// server-side, so the upstream URL never reaches the browser; a transport
+	// failure is answered with the generic message below (never err.Error,
+	// which would embed the upstream redirect target).
+	resp, err := s.client.DoDownload(ctx, http.MethodGet, u, hdr)
 	if err != nil {
 		e := errUpstream("upstream request failed")
 		c.errMsg = e.Code + ": " + e.Message
@@ -383,7 +379,10 @@ func (s *Server) handleTicketDownload(w http.ResponseWriter, r *http.Request, to
 		c.errMsg = "range_not_satisfiable"
 		return
 	}
-	if resp.StatusCode >= 400 && resp.StatusCode != http.StatusNotModified {
+	// A redirect the helper should already have followed server-side is an
+	// upstream failure: forwarding it would leak the direct-link URL through
+	// Location, so it maps to the generic typed error like any other 4xx/5xx.
+	if downloadRedirect(resp.StatusCode) || (resp.StatusCode >= 400 && resp.StatusCode != http.StatusNotModified) {
 		e := errUpstream("upstream returned " + resp.Status)
 		c.errMsg = e.Code + ": " + e.Message
 		e.withDocs(c.base)
@@ -427,6 +426,19 @@ func (s *Server) handleTicketDownload(w http.ResponseWriter, r *http.Request, to
 		c.errMsg = "stream_interrupted: " + copyErr.Error()
 		panic(http.ErrAbortHandler)
 	}
+}
+
+// downloadRedirect reports whether status is one of the redirect codes the
+// openlist DoDownload helper follows server-side. Seeing one in a response
+// means the direct-link hop was not taken: the status is surfaced as a
+// generic upstream failure instead of being forwarded with its Location.
+func downloadRedirect(status int) bool {
+	switch status {
+	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther,
+		http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+		return true
+	}
+	return false
 }
 
 // streamExact copies src to dst, requiring exactly want bytes when want >= 0

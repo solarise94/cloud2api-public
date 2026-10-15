@@ -731,11 +731,11 @@ func TestRawStreamsDownload(t *testing.T) {
 	}
 
 	sent := up.last(t)
-	if sent.Path != "/p/m1/sub/f.bin" {
-		t.Errorf("upstream path = %q, want /p/m1/sub/f.bin", sent.Path)
+	if sent.Path != "/d/m1/sub/f.bin" {
+		t.Errorf("upstream path = %q, want /d/m1/sub/f.bin", sent.Path)
 	}
 	if sent.RawQuery != "sign=server-sign" {
-		t.Errorf("upstream query = %q, want server-fetched sign", sent.RawQuery)
+		t.Errorf("upstream query = %q, want server-fetched sign (client sign=abc must be discarded)", sent.RawQuery)
 	}
 	if sent.Auth != "admin-token" {
 		t.Errorf("upstream Authorization = %q", sent.Auth)

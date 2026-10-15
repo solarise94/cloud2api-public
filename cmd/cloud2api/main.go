@@ -187,6 +187,7 @@ func serve(args []string) error {
 	var portal *admin.Portal
 	if cfg.Admin != nil && cfg.Admin.Enabled {
 		portal = admin.NewPortal(cfg.Admin, registry, client, st, keys, slog.Default())
+		portal.SetWorkspaceHandler(api.WorkspaceHandler())
 		portal.SetReconciler(rec)
 		// Reauth approvals verify the drive's storage with the same guard the
 		// data plane uses (IMPLEMENTATION §agent 的重新登录请求).

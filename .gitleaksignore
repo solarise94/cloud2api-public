@@ -3,10 +3,11 @@ internal/agentapi/tickets_test.go:generic-api-key:486
 openlist-patch/src/drivers/goapi/driver_test.go:generic-api-key:60
 openlist-patch/src/pkg/loginsdk/adapters/aliyunopen/adapter_test.go:generic-api-key:22
 openlist-patch/src/server/connect/api_test.go:generic-api-key:546
-scripts/test-files-page.cjs:generic-api-key:224
-scripts/test-files-page.cjs:generic-api-key:226
-scripts/test-files-page.cjs:generic-api-key:227
-scripts/test-files-page.cjs:generic-api-key:229
+internal/agentapi/workspaces_test.go:generic-api-key:313
+scripts/test-files-page.cjs:generic-api-key:250
+scripts/test-files-page.cjs:generic-api-key:252
+scripts/test-files-page.cjs:generic-api-key:253
+scripts/test-files-page.cjs:generic-api-key:255
 
 # Upstream intentionally publishes this Baidu manual-login application parameter:
 # https://github.com/OpenListTeam/OpenList-APIPages/blob/581b57aa/frontend/src/pages/TokenPage.tsx#L118-L124

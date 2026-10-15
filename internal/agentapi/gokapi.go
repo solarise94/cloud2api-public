@@ -1293,25 +1293,22 @@ func (s *Server) gokapiServeFile(c *call, f store.RelayFile, consume bool) {
 	}
 	q := url.Values{}
 	q.Set("sign", sign)
-	u := url.URL{Path: "/p" + internal, RawQuery: q.Encode()}
+	u := url.URL{Path: "/d" + internal, RawQuery: q.Encode()}
 	hdr := http.Header{}
 	for _, h := range []string{"Range", "If-None-Match", "If-Modified-Since", "If-Range"} {
 		if v := c.r.Header.Get(h); v != "" {
 			hdr.Set(h, v)
 		}
 	}
-	req, err := s.client.NewRequest(ctx, http.MethodGet, u, nil, 0, hdr)
-	if err != nil {
-		gkFail(http.StatusBadGateway, "failed to build download request")
-		return
-	}
-	resp, err := s.client.DoAutoHeal(req)
+	// DoDownload follows OpenList's /d direct-link 302 server-side so the
+	// upstream URL never reaches the Gokapi client; failures stay generic.
+	resp, err := s.client.DoDownload(ctx, http.MethodGet, u, hdr)
 	if err != nil {
 		gkFail(http.StatusBadGateway, "upstream request failed")
 		return
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
+	if downloadRedirect(resp.StatusCode) || resp.StatusCode >= 400 {
 		gkFail(http.StatusBadGateway, "upstream returned "+resp.Status)
 		return
 	}
