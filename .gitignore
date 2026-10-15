@@ -1,0 +1,47 @@
+# Local configuration (contains key hashes / secrets)
+config.yaml
+/config.*.yaml
+!/config.example.yaml
+!/config.production.example.yaml
+.env
+.env.*
+!.env.example
+
+# Simulated cloud drive contents; may hold large test files
+/testdata/
+
+# Build artifacts
+/cloud2api
+/dist/
+*.test
+*.out
+
+# Runtime state: OpenList data, portal state file, admin password
+/openlist-data/
+/cloud2api-data/
+/portal-data/
+
+# Acceptance scratch space (group H fixtures)
+.acc-scratch/
+
+# Local databases, logs, backups and scanner reports
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
+*.log
+*.bak
+*.sarif
+gitleaks-report*.json
+
+# Local tools and dependencies
+/.zcode/
+node_modules/
+__pycache__/
+*.py[cod]

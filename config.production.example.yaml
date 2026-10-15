@@ -1,0 +1,15 @@
+listen: 0.0.0.0:8080
+
+openlist:
+  endpoint: http://127.0.0.1:5244
+  token_env: OPENLIST_TOKEN
+
+admin:
+  enabled: true
+  password_env: ADMIN_PASSWORD
+  state_file: /var/lib/cloud2api/state.json
+  db_file: /var/lib/cloud2api/cloud2api.db
+  session_ttl: 24h
+
+accounts: []
+api_keys: []

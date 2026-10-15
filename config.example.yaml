@@ -1,0 +1,46 @@
+# cloud2api example configuration (DESIGN.md §3, §11, §13).
+# Copy to config.yaml (or /etc/cloud2api/config.yaml) and adjust.
+listen: 0.0.0.0:8080
+
+openlist:
+  endpoint: http://openlist:5244
+  token_env: OPENLIST_TOKEN      # 从环境变量读管理员 Token，不落盘。
+                                  # v0.3.1: 推荐注入 OpenList 的永久设置令牌
+                                  # (/api/admin/setting/get?key=token)，而非 48h
+                                  # 过期的登录 JWT；deploy.sh 已自动处理。可选:
+                                  # OPENLIST_USERNAME / OPENLIST_PASSWORD 环境变量
+                                  # 启用 401 自愈（重新登录并换用永久令牌）。
+
+admin:
+  enabled: true
+  password_env: ADMIN_PASSWORD   # 管理员密码只从环境变量读
+  state_file: /var/lib/cloud2api/state.json   # v0.3 状态文件；v0.4 首次启动导入
+                                  # SQLite 后改名为 state.json.migrated
+  db_file: /var/lib/cloud2api/cloud2api.db    # v0.4 SQLite（drives/keys/audit/…）
+                                  # 可省略，默认取 state_file 同目录
+  session_ttl: 24h               # 可省略，默认 24h
+
+accounts:
+  - id: baidu-main
+    provider: baidu
+    mount_path: /baidu
+    enabled: true
+  - id: pan123-main
+    provider: 123pan
+    mount_path: /123pan
+    enabled: true
+  - id: aliyun-main
+    provider: aliyun
+    mount_path: /aliyun
+    enabled: true
+
+# 静态 API Key：启动时导入 SQLite（static，门户只读）；明文仅创建时可见
+# （cloud2api genkey 生成，v0.4 起签发 sk-c2a-<id>-<secret> 新格式）。
+# permissions 使用 v0.4 词汇 list/read/write/delete/purge/transfer/link/
+# fetch/delegate；旧的 write 自动展开为 write+delete。
+# 动态 Key 通过管理门户 /admin/#/keys 创建（含 chroot、限额、回收站设置）。
+api_keys:
+  - id: histopilot
+    key_hash: "sha256:<hex>"     # 明文仅创建时可见（cloud2api genkey 生成）
+    accounts: [baidu-main, pan123-main]
+    permissions: [list, read, write, transfer]

@@ -1,0 +1,67 @@
+# syntax=docker/dockerfile:1
+# Patched OpenList: the build context is a tree assembled by
+# scripts/prepare-tree.sh (upstream at the pinned commit + patches/ + src/ +
+# the pinned web UI). Only the binary of the official image of the same
+# upstream version is replaced, so its user (uid 1001), entrypoint and data
+# layout stay exactly as upstream ships them. Use scripts/build-image.sh.
+ARG GO_IMAGE
+ARG RUNTIME_IMAGE
+
+FROM ${GO_IMAGE} AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod GOTOOLCHAIN=local go mod download
+COPY . .
+ARG GO_TAGS=jsoniter
+ARG BUILT_AT
+ARG OPENLIST_VERSION
+ARG OPENLIST_COMMIT_SHORT
+ARG FRONTEND_VERSION
+ARG CONNECT_VERSION
+ARG PATCH_SOURCE_REVISION
+# conf.Version must stay the plain upstream tag: OpenList keys its database
+# upgrade patches off it. The patch level is reported by the connect module.
+RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOTOOLCHAIN=local GOFLAGS=-buildvcs=false go build -trimpath -tags "${GO_TAGS}" -o /out/openlist \
+      -ldflags "-w -s \
+        -X 'github.com/OpenListTeam/OpenList/v4/internal/conf.BuiltAt=${BUILT_AT}' \
+        -X 'github.com/OpenListTeam/OpenList/v4/internal/conf.GitAuthor=The OpenList Projects Contributors <noreply@openlist.team>' \
+        -X 'github.com/OpenListTeam/OpenList/v4/internal/conf.GitCommit=${OPENLIST_COMMIT_SHORT}' \
+        -X 'github.com/OpenListTeam/OpenList/v4/internal/conf.Version=${OPENLIST_VERSION}' \
+        -X 'github.com/OpenListTeam/OpenList/v4/internal/conf.WebVersion=${FRONTEND_VERSION}' \
+        -X 'github.com/OpenListTeam/OpenList/v4/server/connect.Version=${CONNECT_VERSION}' \
+        -X 'github.com/OpenListTeam/OpenList/v4/server/connect.SourceRevision=${PATCH_SOURCE_REVISION}'" \
+      .
+
+# The upstream filesystem minus its binary, flattened into one layer so the
+# replaced binary is not shipped twice.
+FROM ${RUNTIME_IMAGE} AS upstream
+USER root
+RUN rm -f /opt/openlist/openlist
+
+FROM scratch
+COPY --from=upstream / /
+COPY --from=build --chown=1001:1001 --chmod=755 /out/openlist /opt/openlist/openlist
+# Runtime config copied from the official image (podman image inspect).
+ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    UMASK=022 \
+    RUN_ARIA2=false
+WORKDIR /opt/openlist/
+USER openlist
+VOLUME /opt/openlist/data/
+EXPOSE 5244 5245
+CMD ["/entrypoint.sh"]
+ARG OPENLIST_VERSION
+ARG OPENLIST_COMMIT
+ARG CONNECT_VERSION
+ARG PATCH_SOURCE_REVISION
+ARG GO_TAGS=jsoniter
+LABEL org.opencontainers.image.title="OpenList with the connect login module" \
+      org.opencontainers.image.version="${OPENLIST_VERSION}-connect.${CONNECT_VERSION}" \
+      org.opencontainers.image.licenses="AGPL-3.0" \
+      org.opencontainers.image.source="https://github.com/OpenListTeam/OpenList" \
+      openlist.upstream.version="${OPENLIST_VERSION}" \
+      openlist.upstream.commit="${OPENLIST_COMMIT}" \
+      openlist.connect.version="${CONNECT_VERSION}" \
+      openlist.connect.source-revision="${PATCH_SOURCE_REVISION}" \
+      openlist.connect.build-tags="${GO_TAGS}"

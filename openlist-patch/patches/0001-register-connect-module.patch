@@ -1,0 +1,31 @@
+diff --git a/server/router.go b/server/router.go
+index dc0e77e..a5346e0 100644
+--- a/server/router.go
++++ b/server/router.go
+@@ -9,6 +9,8 @@ import (
+ 	"github.com/OpenListTeam/OpenList/v4/internal/stream"
+ 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
+ 	"github.com/OpenListTeam/OpenList/v4/server/common"
++	"github.com/OpenListTeam/OpenList/v4/server/connect"
++	"github.com/OpenListTeam/OpenList/v4/server/goapihop"
+ 	"github.com/OpenListTeam/OpenList/v4/server/handles"
+ 	"github.com/OpenListTeam/OpenList/v4/server/middlewares"
+ 	"github.com/OpenListTeam/OpenList/v4/server/static"
+@@ -25,6 +27,7 @@ func Init(e *gin.Engine) {
+ 	}
+ 	Cors(e)
+ 	g := e.Group(conf.URL.Path)
++	g.Use(goapihop.Middleware())
+ 	if conf.Conf.Scheme.HttpPort != -1 && conf.Conf.Scheme.HttpsPort != -1 && conf.Conf.Scheme.ForceHttps {
+ 		e.Use(middlewares.ForceHttps)
+ 	}
+@@ -108,6 +111,9 @@ func Init(e *gin.Engine) {
+ 	_task(auth.Group("/task", middlewares.AuthNotGuest))
+ 	_sharing(auth.Group("/share", middlewares.AuthNotGuest))
+ 	admin(auth.Group("/admin", middlewares.AuthAdmin))
++	// Login and storage-setup module (connect): admin API, OAuth callback and
++	// the minimal setup page. Registered before the SPA fallback below.
++	connect.Register(g)
+ 	if flags.Debug || flags.Dev {
+ 		debug(g.Group("/debug"))
+ 	}

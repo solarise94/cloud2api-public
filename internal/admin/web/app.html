@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="same-origin">
+<title>cloud2api 管理门户</title>
+<link rel="icon" type="image/png" href="/admin/assets/logo.png">
+<link rel="stylesheet" href="/admin/assets/app.css?v=upstream-connect-1">
+</head>
+<body>
+<div id="app" class="app">
+  <aside id="sidebar" class="sidebar" aria-label="主导航"></aside>
+  <div id="sb-overlay" class="sb-overlay" hidden></div>
+  <div class="frame">
+    <header class="topbar">
+      <button id="nav-toggle" class="icon-btn nav-toggle" type="button" aria-label="打开导航菜单" aria-controls="sidebar" aria-expanded="false"></button>
+      <div class="topbar-title">
+        <h1 id="page-title">总览</h1>
+        <span id="page-sub" class="topbar-sub"></span>
+      </div>
+      <div class="topbar-actions">
+        <span id="mock-pill" class="mock-pill" hidden title="当前为演示模式，数据仅存在于内存中">演示模式</span>
+        <button id="theme-btn" class="icon-btn" type="button" aria-label="切换深色主题" title="切换深色主题"></button>
+        <button id="logout-btn" class="icon-btn" type="button" aria-label="退出登录" title="退出登录"></button>
+        <button id="refresh-btn" class="btn btn-ghost btn-sm" type="button" title="刷新当前页面"></button>
+      </div>
+    </header>
+    <main id="page" class="page" aria-live="polite"></main>
+  </div>
+</div>
+<div id="modal-root"></div>
+<div id="toast-root" class="toast-root" aria-live="assertive"></div>
+<script src="/admin/assets/api.js?v=upstream-connect-1"></script>
+<script src="/admin/assets/mock.js?v=upstream-connect-1"></script>
+<script src="/admin/assets/ui.js?v=upstream-connect-1"></script>
+<script src="/admin/assets/pages-main.js?v=upstream-connect-1"></script>
+<script src="/admin/assets/pages-drives.js?v=upstream-connect-1"></script>
+<script src="/admin/assets/pages-keys.js?v=upstream-connect-1"></script>
+<script src="/admin/assets/app.js?v=upstream-connect-1"></script>
+</body>
+</html>

@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="same-origin">
+<title>cloud2api 管理门户 - 登录</title>
+<link rel="icon" type="image/png" href="/admin/assets/logo.png">
+<style>
+  :root {
+    --accent: #30302c; --accent-hover: #151513;
+    --text: #292925; --text-2: #686863; --text-3: #85857e;
+    --border: #e6e6e3; --border-strong: #d6d6d1;
+    --danger: #d02f2f; --danger-soft: #fdeaea;
+    --font: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: var(--font);
+    background: radial-gradient(ellipse at 50% 15%, #edf6e7 0%, #fafafa 60%);
+    min-height: 100vh;
+    display: flex; align-items: center; justify-content: center;
+    padding: 24px;
+    color: var(--text);
+    -webkit-font-smoothing: antialiased;
+  }
+  .shell { width: 380px; max-width: 100%; }
+  .brand { display: flex; align-items: center; gap: 11px; margin-bottom: 18px; }
+  .brand-mark {
+    width: 84px; height: 84px; border-radius: 16px; overflow: hidden; flex: 0 0 auto;
+    background: transparent;
+    display: flex; align-items: center; justify-content: center; color: #244d3c;
+  }
+  .brand-mark img { display: block; width: 100%; height: 100%; object-fit: contain; }
+  .brand-name { font-size: 17px; font-weight: 700; letter-spacing: .01em; }
+  .brand-sub { font-size: 12.5px; color: var(--text-3); }
+  .card {
+    background: #fff; border: 1px solid var(--border); border-radius: 20px;
+    box-shadow: 0 4px 12px rgba(22,32,46,.06), 0 1px 3px rgba(22,32,46,.05);
+    padding: 26px 26px 24px;
+  }
+  h1 { font-size: 22px; font-weight: 650; margin: 0 0 4px; }
+  .hint { font-size: 13px; color: var(--text-2); margin: 0 0 18px; }
+  label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; }
+  input {
+    width: 100%; padding: 9px 12px; font-size: 14px; font-family: inherit;
+    border: 1px solid var(--border-strong); border-radius: 9px; color: var(--text);
+    transition: border-color .12s, box-shadow .12s;
+  }
+  input:focus { outline: none; border-color: #078762; box-shadow: 0 0 0 3px rgba(20,184,139,.12); }
+  button {
+    width: 100%; margin-top: 16px; padding: 10px 14px;
+    font-family: inherit; font-size: 14px; font-weight: 600;
+    border: 0; border-radius: 9px; cursor: pointer;
+    background: var(--accent); color: #fff;
+    transition: background .12s;
+  }
+  button:hover { background: var(--accent-hover); }
+  button:disabled { opacity: .6; cursor: not-allowed; }
+  #err {
+    color: var(--danger); font-size: 13px; min-height: 1.3em; margin: 10px 0 0;
+    background: none; border-radius: 8px; padding: 0;
+  }
+  #err:not(:empty) { background: var(--danger-soft); padding: 8px 11px; }
+  .foot { text-align: center; font-size: 12px; color: var(--text-3); margin-top: 16px; }
+  .foot a { color: var(--text-2); text-underline-offset: 3px; }
+  .shell { animation: arrive .35s cubic-bezier(.2,.7,.2,1) both; }
+  button { border-radius: 12px; transition: background .16s, transform .16s; }
+  button:active:not(:disabled) { transform: scale(.98); }
+  button:focus-visible { outline: 2px solid #078762; outline-offset: 3px; }
+  @keyframes arrive { from { opacity: 0; transform: translateY(10px); } }
+  @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
+</style>
+</head>
+<body>
+<div class="shell">
+  <div class="brand">
+    <div class="brand-mark">
+      <img src="/admin/assets/logo.png" alt="cloud2api logo" width="84" height="84" decoding="async">
+    </div>
+    <div>
+      <div class="brand-name">cloud2api</div>
+      <div class="brand-sub">网盘 · Agent 网关 — 管理门户</div>
+    </div>
+  </div>
+  <div class="card">
+    <h1>登录</h1>
+    <p class="hint">输入管理员密码进入管理门户</p>
+    <form onsubmit="return doLogin(event)">
+      <label for="pw">管理员密码</label>
+      <input type="password" id="pw" placeholder="管理员密码" autocomplete="current-password" required>
+      <button type="submit" id="btn">登录</button>
+      <p id="err" role="alert"></p>
+    </form>
+  </div>
+  <div class="foot">登录态由 Session Cookie 保持，仅管理员可用</div>
+  <div class="foot"><a href="/files/">只需浏览、上传或分享？进入「我的文件」</a></div>
+</div>
+<script>
+async function doLogin(e) {
+  e.preventDefault();
+  const btn = document.getElementById('btn');
+  const err = document.getElementById('err');
+  btn.disabled = true; btn.textContent = '登录中…'; err.textContent = '';
+  try {
+    const r = await fetch('/admin/api/login', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({password: document.getElementById('pw').value})
+    });
+    if (r.ok) { location.href = '/admin/'; return false; }
+    if (r.status === 429) {
+      // login rate limit (5 failed/min per IP): wait out the Retry-After window
+      let wait = 60;
+      const ra = Number(r.headers.get('Retry-After'));
+      if (isFinite(ra) && ra > 0) wait = Math.ceil(ra);
+      const until = Date.now() + wait * 1000;
+      const tick = () => {
+        const left = Math.max(0, Math.ceil((until - Date.now()) / 1000));
+        if (left <= 0) {
+          btn.disabled = false; btn.textContent = '登录';
+          err.textContent = '尝试次数过多，可以重新输入密码登录了';
+          return;
+        }
+        btn.disabled = true;
+        btn.textContent = '请等待 ' + left + ' 秒';
+        err.textContent = '尝试过于频繁（每分钟最多 5 次），请 ' + left + ' 秒后重试';
+        setTimeout(tick, 500);
+      };
+      tick();
+      return false;
+    }
+    let msg = '密码错误';
+    try { const doc = await r.json(); if (doc && doc.message) msg = '登录失败：' + doc.message; } catch (_) {}
+    err.textContent = msg;
+  } catch (_) {
+    err.textContent = '网络错误：无法连接管理接口';
+  }
+  btn.disabled = false; btn.textContent = '登录';
+  return false;
+}
+</script>
+</body>
+</html>

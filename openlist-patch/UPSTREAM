@@ -1,0 +1,22 @@
+# Pinned inputs of the patched OpenList build (shell-sourceable KEY=VALUE).
+# Changing any line here is an upstream update: re-run scripts/test.sh and
+# scripts/e2e.sh and record the result in README.md before deploying.
+
+# OpenList backend (file engine) — tag and the exact commit it must resolve to.
+OPENLIST_REPO=https://github.com/OpenListTeam/OpenList.git
+OPENLIST_VERSION=v4.2.6
+OPENLIST_COMMIT=2bdf16d5967d0a403f67d809efd5a418b8f5bd30
+
+# Upstream web UI, embedded unchanged as the native admin / advanced storage
+# form fallback. The connect page is a separate build and does not use it.
+FRONTEND_VERSION=v4.2.6
+FRONTEND_URL=https://github.com/OpenListTeam/OpenList-Frontend/releases/download/v4.2.6/openlist-frontend-dist-v4.2.6.tar.gz
+FRONTEND_SHA256=eb620950a07dd081c5470a91361bde018ffd6a3cefb5b9a11b0f24f07960b444
+
+# Build toolchain and runtime base (the official v4.2.6 linux/amd64 image; only
+# its /opt/openlist/openlist binary is replaced).
+GO_IMAGE=docker.io/library/golang:1.27.0-alpine
+RUNTIME_IMAGE=docker.io/openlistteam/openlist@sha256:c942c98018ae219aeed5bff38e7f638964febe0eddccc68e856b1aeb17a16d2e
+
+# Version of this patch set (connect module + patches/). Bump on every change.
+CONNECT_VERSION=4

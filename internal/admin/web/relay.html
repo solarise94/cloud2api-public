@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>cloud2api 中转上传工具</title>
+<link rel="icon" type="image/png" href="/admin/assets/logo.png">
+<link rel="stylesheet" href="/relay/assets/relay.css?v=upstream-connect-1">
+</head>
+<body>
+<div class="shell">
+  <div class="brand">
+    <div class="brand-mark">
+      <img src="/admin/assets/logo.png" alt="cloud2api logo" width="72" height="72" decoding="async">
+    </div>
+    <div>
+      <div class="brand-name">cloud2api</div>
+      <div class="brand-sub">网盘 · Agent 网关 — 中转上传工具</div>
+    </div>
+  </div>
+
+  <!-- ======== gate: paste key ======== -->
+  <div class="card" id="gate">
+    <h1>中转上传工具</h1>
+    <p class="hint">粘贴<b>本实例</b>签发的、具有中转权限（relay）的 API Key（sk-c2a-…）。这是一个受限的上传/下载中转工具，不是网盘连接：网盘（包括把另一台 GoAPI 实例的 API 连接为上游存储）由管理员在管理门户「添加网盘」经 OpenList 配置，凭据只填在 OpenList。</p>
+    <form id="login-form">
+      <label for="key">本实例 API Key</label>
+      <div class="key-row">
+        <input type="password" id="key" placeholder="sk-c2a-…" autocomplete="off" spellcheck="false" required>
+        <button type="button" id="key-toggle" class="mini" title="显示/隐藏">显示</button>
+      </div>
+      <button type="submit" id="btn">进入工具</button>
+      <p id="err" role="alert"></p>
+    </form>
+    <p class="privacy">Key 只保留在本页内存中，通过 <code>apikey</code> 请求头发送；不写入 URL、本地存储或 Cookie。刷新或退出后需重新输入。这里使用的 API Key 由本实例签发，与连接上游存储所用的 API Key 无关。</p>
+  </div>
+
+  <!-- ======== app: relay workspace ======== -->
+  <div id="app" hidden>
+    <div class="card">
+      <div class="app-head">
+        <div>
+          <h1 class="app-title">中转上传工具</h1>
+          <div class="key-line">Key <span class="mono" id="me-prefix">—</span></div>
+        </div>
+        <button type="button" id="logout" class="btn-ghosty">退出登录</button>
+      </div>
+      <div id="relay-warn" class="banner warn" hidden></div>
+      <dl class="kv" id="me-kv"></dl>
+    </div>
+
+    <div class="card" id="upload-card">
+      <h2>上传到中转</h2>
+      <div class="upload-row">
+        <input type="file" id="file">
+        <button type="button" id="upload-btn" class="btn">上传</button>
+      </div>
+      <div class="upload-opts">
+        <label>保留天数
+          <select id="expiry">
+            <option value="1">1 天</option>
+            <option value="3">3 天</option>
+            <option value="7" selected>7 天（上限）</option>
+          </select>
+        </label>
+        <label>下载次数上限
+          <select id="downloads">
+            <option value="" selected>不限</option>
+            <option value="1">1 次</option>
+            <option value="3">3 次</option>
+            <option value="10">10 次</option>
+          </select>
+        </label>
+      </div>
+      <div class="progress" id="progress" hidden>
+        <div class="progress-bar" id="progress-bar"></div>
+      </div>
+      <div class="status-line" id="upload-status"></div>
+      <div class="actions">
+        <button type="button" id="cancel-btn" class="btn-ghosty" hidden>取消上传</button>
+      </div>
+    </div>
+
+    <div class="card" id="result-card" hidden>
+      <h2>上传结果</h2>
+      <div id="result-body"></div>
+      <div class="actions">
+        <button type="button" id="copy-result" class="btn-ghosty">复制结果 JSON（给模型/agent）</button>
+        <button type="button" id="recheck-btn" class="btn-ghosty" hidden>重新查询该上传 ID</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="app-head">
+        <h2>中转文件</h2>
+        <button type="button" id="refresh-btn" class="btn-ghosty">刷新</button>
+      </div>
+      <div id="files-host"><p class="muted">加载中…</p></div>
+    </div>
+  </div>
+
+  <div class="foot">中转权限不绕过根目录、上传大小、配额与有效期检查；文件存放在 OpenList 连接的存储上。本工具不是网盘连接入口</div>
+</div>
+<script src="/relay/assets/relay.js?v=upstream-connect-1"></script>
+</body>
+</html>

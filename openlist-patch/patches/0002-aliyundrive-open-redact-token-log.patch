@@ -1,0 +1,13 @@
+diff --git a/drivers/aliyundrive_open/util.go b/drivers/aliyundrive_open/util.go
+index 2211233..0ed86e7 100644
+--- a/drivers/aliyundrive_open/util.go
++++ b/drivers/aliyundrive_open/util.go
+@@ -131,7 +131,7 @@ func (d *AliyundriveOpen) refreshToken(ctx context.Context) error {
+ 	if err != nil {
+ 		return err
+ 	}
+-	log.Infof("[ali_open] token exchange: %s -> %s", d.RefreshToken, refresh)
++	log.Infof("[ali_open] token refreshed")
+ 	d.RefreshToken, d.AccessToken = refresh, access
+ 	op.MustSaveDriverStorage(d)
+ 	return nil

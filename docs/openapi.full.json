@@ -1,0 +1,1590 @@
+{
+  "info": {
+    "description": "Agent-friendly netdisk API. Authenticate with the `apikey` header (Bearer also accepted). All paths are logical paths inside the key's per-drive root; responses never contain OpenList internals. Long operations run as jobs with long-polling; destructive operations support dry_run.",
+    "title": "cloud2api agent gateway (full protocol)",
+    "version": "v0.4-1b"
+  },
+  "openapi": "3.0.3",
+  "paths": {
+    "/api/chunk/add": {
+      "post": {
+        "parameters": [
+          {
+            "name": "X-Upload-ID",
+            "in": "header",
+            "required": false,
+            "description": "optional client upload id; repeated staging may reuse it (metadata only, outcome never reset)"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "properties": {
+                  "file": {
+                    "format": "binary",
+                    "type": "string"
+                  },
+                  "filesize": {
+                    "description": "total file size in bytes",
+                    "type": "integer"
+                  },
+                  "offset": {
+                    "description": "chunk offset from the beginning of the file",
+                    "type": "integer"
+                  },
+                  "uuid": {
+                    "description": ">= 10 characters, same for all chunks",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "file",
+                  "uuid",
+                  "filesize",
+                  "offset"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "summary": "Gokapi-compat: stage one chunk (multipart file, uuid, filesize, offset; >=5 MiB except the last); staging acknowledgement, NOT upload completion",
+        "tags": [
+          "gokapi-compat"
+        ]
+      }
+    },
+    "/api/chunk/complete": {
+      "post": {
+        "parameters": [
+          {
+            "name": "uuid",
+            "in": "header",
+            "required": true,
+            "description": "the chunk upload uuid"
+          },
+          {
+            "name": "filename",
+            "in": "header",
+            "required": true,
+            "description": "final filename ('base64:...' allowed)"
+          },
+          {
+            "name": "filesize",
+            "in": "header",
+            "required": true,
+            "description": "total size in bytes"
+          },
+          {
+            "name": "contenttype",
+            "in": "header",
+            "required": false,
+            "description": "MIME type"
+          },
+          {
+            "name": "allowedDownloads",
+            "in": "header",
+            "required": false,
+            "description": "default 1; 0 = unlimited"
+          },
+          {
+            "name": "expiryDays",
+            "in": "header",
+            "required": false,
+            "description": "capped at the key's relay max age; 0 = max"
+          },
+          {
+            "name": "nonblocking",
+            "in": "header",
+            "required": false,
+            "description": "true: acknowledge immediately and finish in the background"
+          },
+          {
+            "name": "X-Upload-ID",
+            "in": "header",
+            "required": false,
+            "description": "client-chosen random upload id; adopts the receipt staged with it — a finished attempt answers 409 and needs a fresh id"
+          }
+        ],
+        "summary": "Gokapi-compat: assemble staged chunks into a relay file; returns UploadId/Status (nonblocking=true answers Status=uploading and finishes in the background; poll /api/files/status/{uploadId}). A duplicate completion of a finished attempt answers 409",
+        "tags": [
+          "gokapi-compat"
+        ]
+      }
+    },
+    "/api/files/add": {
+      "post": {
+        "parameters": [
+          {
+            "name": "password",
+            "in": "header",
+            "required": false,
+            "description": "rejected with 400 when non-empty: the relay does not support passwords"
+          },
+          {
+            "name": "X-Upload-ID",
+            "in": "header",
+            "required": false,
+            "description": "client-chosen random upload id; the immutable identity of this one attempt — a reused id answers 409, retries need a fresh id"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "properties": {
+                  "allowedDownloads": {
+                    "description": "default 1; 0 = unlimited",
+                    "type": "integer"
+                  },
+                  "expiryDays": {
+                    "description": "capped at the key's relay max age (<= 7); 0 = max",
+                    "type": "integer"
+                  },
+                  "file": {
+                    "format": "binary",
+                    "type": "string"
+                  },
+                  "password": {
+                    "description": "rejected with 400 when non-empty",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "file"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "summary": "Gokapi-compat: multipart upload (file, allowedDownloads, expiryDays); returns UploadResult with CRC64 decimal string plus UploadId/Status receipt fields",
+        "tags": [
+          "gokapi-compat"
+        ]
+      }
+    },
+    "/api/files/delete": {
+      "delete": {
+        "parameters": [
+          {
+            "name": "id",
+            "in": "header",
+            "required": true,
+            "description": "the file id to delete"
+          },
+          {
+            "name": "delay",
+            "in": "header",
+            "required": false,
+            "description": "seconds to wait before deleting (cancellable via /api/files/restore)"
+          }
+        ],
+        "summary": "Gokapi-compat: delete now, or arm a cancellable delayed deletion",
+        "tags": [
+          "gokapi-compat"
+        ]
+      }
+    },
+    "/api/files/download/{id}": {
+      "get": {
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "path parameter"
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "file id"
+          },
+          {
+            "name": "increaseCounter",
+            "in": "header",
+            "required": false,
+            "description": "consume one download when true"
+          },
+          {
+            "name": "presignUrl",
+            "in": "header",
+            "required": false,
+            "description": "not supported; answers 400 when true"
+          }
+        ],
+        "summary": "Gokapi-compat: authenticated file download",
+        "tags": [
+          "gokapi-compat"
+        ]
+      }
+    },
+    "/api/files/list": {
+      "get": {
+        "summary": "Gokapi-compat: this key's relay files (array, or null when empty)",
+        "tags": [
+          "gokapi-compat"
+        ]
+      }
+    },
+    "/api/files/list/{id}": {
+      "get": {
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "path parameter"
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "file id"
+          }
+        ],
+        "summary": "Gokapi-compat: one relay file's metadata",
+        "tags": [
+          "gokapi-compat"
+        ]
+      }
+    },
+    "/api/files/restore": {
+      "post": {
+        "parameters": [
+          {
+            "name": "id",
+            "in": "header",
+            "required": true,
+            "description": "the file id to restore"
+          }
+        ],
+        "summary": "Gokapi-compat: cancel a pending delayed deletion",
+        "tags": [
+          "gokapi-compat"
+        ]
+      }
+    },
+    "/api/files/status/{uploadId}": {
+      "get": {
+        "parameters": [
+          {
+            "name": "uploadId",
+            "in": "path",
+            "required": true,
+            "description": "path parameter"
+          },
+          {
+            "name": "uploadId",
+            "in": "path",
+            "required": true,
+            "description": "the upload id returned by /api/files/add or /api/chunk/complete"
+          }
+        ],
+        "summary": "Gokapi-compat additive: one upload receipt of this key (uploading|completed|failed|interrupted); unknown or foreign ids answer 404",
+        "tags": [
+          "gokapi-compat"
+        ]
+      }
+    },
+    "/api/info/config": {
+      "get": {
+        "summary": "Gokapi-compat: upload parameters (MiB; relay permission)",
+        "tags": [
+          "gokapi-compat"
+        ]
+      }
+    },
+    "/api/info/version": {
+      "get": {
+        "summary": "Gokapi-compat: server version",
+        "tags": [
+          "gokapi-compat"
+        ]
+      }
+    },
+    "/apidocumentation/openapi.json": {
+      "get": {
+        "summary": "This document",
+        "tags": [
+          "assets"
+        ]
+      }
+    },
+    "/custom/SKILL.md": {
+      "get": {
+        "summary": "Skill description for agent skill directories",
+        "tags": [
+          "assets"
+        ]
+      }
+    },
+    "/custom/agent-instructions.txt": {
+      "get": {
+        "summary": "Per-request rendered agent onboarding instructions",
+        "tags": [
+          "assets"
+        ]
+      }
+    },
+    "/custom/c2a.py": {
+      "get": {
+        "summary": "Stdlib-only Python CLI helper",
+        "tags": [
+          "assets"
+        ]
+      }
+    },
+    "/custom/gokapi-agent-instructions.txt": {
+      "get": {
+        "summary": "Gokapi-style onboarding instructions rendered with this gateway's base URL and policy",
+        "tags": [
+          "gokapi-compat"
+        ]
+      }
+    },
+    "/d": {
+      "get": {
+        "parameters": [
+          {
+            "name": "id",
+            "in": "query",
+            "required": true,
+            "description": "file id"
+          }
+        ],
+        "summary": "Gokapi-compat: public HTML share page (UrlDownload)",
+        "tags": [
+          "gokapi-compat"
+        ]
+      }
+    },
+    "/downloadFile": {
+      "get": {
+        "parameters": [
+          {
+            "name": "id",
+            "in": "query",
+            "required": true,
+            "description": "file id"
+          }
+        ],
+        "summary": "Gokapi-compat: public raw download by id (consumes one download)",
+        "tags": [
+          "gokapi-compat"
+        ]
+      }
+    },
+    "/h/{hotlinkId}": {
+      "get": {
+        "parameters": [
+          {
+            "name": "hotlinkId",
+            "in": "path",
+            "required": true,
+            "description": "path parameter"
+          },
+          {
+            "name": "hotlinkId",
+            "in": "path",
+            "required": true,
+            "description": "hotlink id"
+          }
+        ],
+        "summary": "Gokapi-compat: public raw download by hotlink id (UrlHotlink; consumes one download)",
+        "tags": [
+          "gokapi-compat"
+        ]
+      }
+    },
+    "/healthz": {
+      "get": {
+        "summary": "Liveness",
+        "tags": [
+          "health"
+        ]
+      }
+    },
+    "/l/{token}": {
+      "get": {
+        "parameters": [
+          {
+            "name": "token",
+            "in": "path",
+            "required": true,
+            "description": "path parameter"
+          }
+        ],
+        "summary": "Download via a limited-time link (no API key); expired/revoked answers 410",
+        "tags": [
+          "links"
+        ]
+      }
+    },
+    "/readyz": {
+      "get": {
+        "summary": "Readiness (OpenList reachable, admin token valid)",
+        "tags": [
+          "health"
+        ]
+      }
+    },
+    "/v1": {
+      "get": {
+        "summary": "Entry index: quickstart and asset URLs",
+        "tags": [
+          "discovery"
+        ]
+      }
+    },
+    "/v1/activity": {
+      "get": {
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "default 50, max 200"
+          }
+        ],
+        "summary": "This key's recent audit entries (logical paths only)",
+        "tags": [
+          "discovery"
+        ]
+      }
+    },
+    "/v1/batch": {
+      "post": {
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "description": "replay-safe retry within 24h"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "dry_run": {
+                    "type": "boolean"
+                  },
+                  "ops": {
+                    "items": {
+                      "properties": {
+                        "drive": {
+                          "type": "string"
+                        },
+                        "from": {
+                          "description": "move/copy source",
+                          "properties": {
+                            "drive": {
+                              "type": "string"
+                            },
+                            "path": {
+                              "type": "string"
+                            }
+                          },
+                          "type": "object"
+                        },
+                        "on_conflict": {
+                          "enum": [
+                            "fail",
+                            "overwrite",
+                            "rename"
+                          ],
+                          "type": "string"
+                        },
+                        "op": {
+                          "enum": [
+                            "mkdir",
+                            "delete",
+                            "move",
+                            "copy"
+                          ],
+                          "type": "string"
+                        },
+                        "path": {
+                          "type": "string"
+                        },
+                        "paths": {
+                          "items": {
+                            "type": "string"
+                          },
+                          "type": "array"
+                        },
+                        "to": {
+                          "description": "move/copy destination",
+                          "properties": {
+                            "drive": {
+                              "type": "string"
+                            },
+                            "path": {
+                              "type": "string"
+                            }
+                          },
+                          "type": "object"
+                        }
+                      },
+                      "required": [
+                        "op"
+                      ],
+                      "type": "object"
+                    },
+                    "maxItems": 100,
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "ops"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "summary": "Up to 100 mkdir/delete/move/copy ops; cross-drive copies turn the batch into a job (202)",
+        "tags": [
+          "jobs"
+        ]
+      }
+    },
+    "/v1/delete": {
+      "post": {
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "paths": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "paths"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "summary": "delete via the key's default drive",
+        "tags": [
+          "files"
+        ]
+      }
+    },
+    "/v1/drives": {
+      "get": {
+        "summary": "Drives granted to this key (with health)",
+        "tags": [
+          "discovery"
+        ]
+      }
+    },
+    "/v1/drives/{drive}/delete": {
+      "post": {
+        "parameters": [
+          {
+            "name": "drive",
+            "in": "path",
+            "required": true,
+            "description": "path parameter"
+          },
+          {
+            "name": "drive",
+            "in": "path",
+            "required": true,
+            "description": "drive id"
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "description": "replay-safe retry within 24h"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "paths": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "paths"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "summary": "Delete paths (into /.c2a-trash when the key has trash enabled); missing paths answer already_absent",
+        "tags": [
+          "files"
+        ]
+      }
+    },
+    "/v1/drives/{drive}/files": {
+      "get": {
+        "parameters": [
+          {
+            "name": "drive",
+            "in": "path",
+            "required": true,
+            "description": "path parameter"
+          },
+          {
+            "name": "drive",
+            "in": "path",
+            "required": true,
+            "description": "drive id"
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "required": true,
+            "description": "logical file path"
+          }
+        ],
+        "summary": "Stream a file (Range supported); X-C2A-SHA256/X-C2A-CRC64 set when an upload record matches",
+        "tags": [
+          "files"
+        ]
+      },
+      "put": {
+        "parameters": [
+          {
+            "name": "drive",
+            "in": "path",
+            "required": true,
+            "description": "path parameter"
+          },
+          {
+            "name": "drive",
+            "in": "path",
+            "required": true,
+            "description": "drive id"
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "required": true,
+            "description": "logical target path"
+          },
+          {
+            "name": "on_conflict",
+            "in": "query",
+            "required": false,
+            "description": "fail (default) | overwrite | rename"
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "description": "replay-safe retry within 24h"
+          },
+          {
+            "name": "X-Expected-CRC64",
+            "in": "header",
+            "required": false,
+            "description": "decimal CRC-64/XZ; mismatch deletes the upload and returns 422"
+          },
+          {
+            "name": "X-Expected-SHA256",
+            "in": "header",
+            "required": false,
+            "description": "hex sha256; mismatch deletes the upload and returns 422"
+          }
+        ],
+        "summary": "Upload raw body (Content-Length required) or multipart `file` part; CRC64 (CRC-64/XZ) and SHA-256 computed server-side",
+        "tags": [
+          "files"
+        ]
+      }
+    },
+    "/v1/drives/{drive}/list": {
+      "get": {
+        "parameters": [
+          {
+            "name": "drive",
+            "in": "path",
+            "required": true,
+            "description": "path parameter"
+          },
+          {
+            "name": "drive",
+            "in": "path",
+            "required": true,
+            "description": "drive id"
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "required": false,
+            "description": "logical directory path inside the key root (default /)"
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "description": "1-based page number (default 1)"
+          },
+          {
+            "name": "per_page",
+            "in": "query",
+            "required": false,
+            "description": "entries per page (default 200, max 1000)"
+          }
+        ],
+        "summary": "List a directory page",
+        "tags": [
+          "files"
+        ]
+      }
+    },
+    "/v1/drives/{drive}/mkdir": {
+      "post": {
+        "parameters": [
+          {
+            "name": "drive",
+            "in": "path",
+            "required": true,
+            "description": "path parameter"
+          },
+          {
+            "name": "drive",
+            "in": "path",
+            "required": true,
+            "description": "drive id"
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "description": "replay-safe retry within 24h"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "path"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "summary": "Create a directory recursively (idempotent)",
+        "tags": [
+          "files"
+        ]
+      }
+    },
+    "/v1/drives/{drive}/move": {
+      "post": {
+        "parameters": [
+          {
+            "name": "drive",
+            "in": "path",
+            "required": true,
+            "description": "path parameter"
+          },
+          {
+            "name": "drive",
+            "in": "path",
+            "required": true,
+            "description": "drive id"
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "description": "replay-safe retry within 24h"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "from": {
+                    "type": "string"
+                  },
+                  "on_conflict": {
+                    "enum": [
+                      "fail",
+                      "overwrite",
+                      "rename"
+                    ],
+                    "type": "string"
+                  },
+                  "to": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "from",
+                  "to"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "summary": "Move or rename within the drive",
+        "tags": [
+          "files"
+        ]
+      }
+    },
+    "/v1/drives/{drive}/search": {
+      "get": {
+        "parameters": [
+          {
+            "name": "drive",
+            "in": "path",
+            "required": true,
+            "description": "path parameter"
+          },
+          {
+            "name": "drive",
+            "in": "path",
+            "required": true,
+            "description": "drive id"
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "required": true,
+            "description": "search keywords"
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "required": false,
+            "description": "logical root of the search (default /)"
+          }
+        ],
+        "summary": "Case-insensitive substring search on one drive (OpenList index when enabled, else bounded walk)",
+        "tags": [
+          "browse"
+        ]
+      }
+    },
+    "/v1/drives/{drive}/stat": {
+      "get": {
+        "parameters": [
+          {
+            "name": "drive",
+            "in": "path",
+            "required": true,
+            "description": "path parameter"
+          },
+          {
+            "name": "drive",
+            "in": "path",
+            "required": true,
+            "description": "drive id"
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "required": true,
+            "description": "logical path"
+          }
+        ],
+        "summary": "Metadata of one path; includes recorded upload checksums when size+mtime are unchanged",
+        "tags": [
+          "files"
+        ]
+      }
+    },
+    "/v1/drives/{drive}/tree": {
+      "get": {
+        "parameters": [
+          {
+            "name": "drive",
+            "in": "path",
+            "required": true,
+            "description": "path parameter"
+          },
+          {
+            "name": "drive",
+            "in": "path",
+            "required": true,
+            "description": "drive id"
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "required": false,
+            "description": "logical directory path (default /)"
+          },
+          {
+            "name": "depth",
+            "in": "query",
+            "required": false,
+            "description": "levels to descend (default 3, max 10)"
+          },
+          {
+            "name": "max_entries",
+            "in": "query",
+            "required": false,
+            "description": "entry cap (default 2000, max 10000)"
+          }
+        ],
+        "summary": "Directory tree on one drive (bounded by depth and max_entries)",
+        "tags": [
+          "browse"
+        ]
+      }
+    },
+    "/v1/fetch": {
+      "post": {
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "description": "replay-safe retry within 24h"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "drive": {
+                    "type": "string"
+                  },
+                  "dry_run": {
+                    "type": "boolean"
+                  },
+                  "on_conflict": {
+                    "default": "fail",
+                    "enum": [
+                      "fail",
+                      "overwrite",
+                      "rename"
+                    ],
+                    "type": "string"
+                  },
+                  "path": {
+                    "description": "target file path inside the drive",
+                    "type": "string"
+                  },
+                  "url": {
+                    "description": "absolute http(s) URL",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "url",
+                  "path"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "summary": "Download a public URL into a drive via OpenList offline download (SimpleHttp); answers 202 {job}",
+        "tags": [
+          "jobs"
+        ]
+      }
+    },
+    "/v1/files": {
+      "get": {
+        "parameters": [
+          {
+            "name": "path",
+            "in": "query",
+            "required": true,
+            "description": "logical file path"
+          }
+        ],
+        "summary": "download via the key's default drive",
+        "tags": [
+          "files"
+        ]
+      },
+      "put": {
+        "parameters": [
+          {
+            "name": "path",
+            "in": "query",
+            "required": true,
+            "description": "logical target path"
+          },
+          {
+            "name": "on_conflict",
+            "in": "query",
+            "required": false,
+            "description": "fail|overwrite|rename"
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "description": "replay-safe retry"
+          },
+          {
+            "name": "X-Expected-CRC64",
+            "in": "header",
+            "required": false,
+            "description": "expected CRC-64/XZ decimal"
+          },
+          {
+            "name": "X-Expected-SHA256",
+            "in": "header",
+            "required": false,
+            "description": "expected sha256 hex"
+          }
+        ],
+        "summary": "upload via the key's default drive",
+        "tags": [
+          "files"
+        ]
+      }
+    },
+    "/v1/jobs": {
+      "get": {
+        "parameters": [
+          {
+            "name": "state",
+            "in": "query",
+            "required": false,
+            "description": "queued|running|succeeded|failed|canceled"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "default 50, max 200"
+          }
+        ],
+        "summary": "List this key's jobs (filter by state)",
+        "tags": [
+          "jobs"
+        ]
+      }
+    },
+    "/v1/jobs/{id}": {
+      "get": {
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "path parameter"
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "job id"
+          },
+          {
+            "name": "wait",
+            "in": "query",
+            "required": false,
+            "description": "seconds to wait for a state change (max 60)"
+          }
+        ],
+        "summary": "One job; ?wait=N long-polls up to 60s and returns early on state change",
+        "tags": [
+          "jobs"
+        ]
+      }
+    },
+    "/v1/jobs/{id}/cancel": {
+      "post": {
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "path parameter"
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "job id"
+          }
+        ],
+        "summary": "Cancel a queued/running job (OpenList tasks are canceled where possible)",
+        "tags": [
+          "jobs"
+        ]
+      }
+    },
+    "/v1/keys": {
+      "get": {
+        "summary": "List this key's child keys (delegate permission)",
+        "tags": [
+          "keys"
+        ]
+      },
+      "post": {
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "drives": {
+                    "items": {
+                      "properties": {
+                        "drive": {
+                          "type": "string"
+                        },
+                        "perms": {
+                          "items": {
+                            "type": "string"
+                          },
+                          "type": "array"
+                        },
+                        "root": {
+                          "type": "string"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "global_perms": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "id": {
+                    "description": "optional child key id",
+                    "type": "string"
+                  },
+                  "ttl_seconds": {
+                    "description": "default 86400, max 604800",
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "drives"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "summary": "Create a child key that must stay a subset of this key (delegate permission); TTL default 24h, max 7d",
+        "tags": [
+          "keys"
+        ]
+      }
+    },
+    "/v1/keys/{id}": {
+      "delete": {
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "path parameter"
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "child key id"
+          }
+        ],
+        "summary": "Revoke one of this key's descendants (delegate permission)",
+        "tags": [
+          "keys"
+        ]
+      }
+    },
+    "/v1/links": {
+      "post": {
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "description": "replay-safe retry within 24h"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "drive": {
+                    "type": "string"
+                  },
+                  "expires_in": {
+                    "description": "seconds, default 3600, max 604800",
+                    "type": "integer"
+                  },
+                  "path": {
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "summary": "Create a limited-time direct link (max 7 days)",
+        "tags": [
+          "links"
+        ]
+      }
+    },
+    "/v1/list": {
+      "get": {
+        "parameters": [
+          {
+            "name": "path",
+            "in": "query",
+            "required": false,
+            "description": "logical directory path (default /)"
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "description": "page"
+          },
+          {
+            "name": "per_page",
+            "in": "query",
+            "required": false,
+            "description": "page size"
+          }
+        ],
+        "summary": "list via the key's default drive",
+        "tags": [
+          "files"
+        ]
+      }
+    },
+    "/v1/me": {
+      "get": {
+        "summary": "This key's drives, permissions, limits, trash, relay hop capability (relay_hop_limit) and policy",
+        "tags": [
+          "discovery"
+        ]
+      }
+    },
+    "/v1/mkdir": {
+      "post": {
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "path"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "summary": "mkdir via the key's default drive",
+        "tags": [
+          "files"
+        ]
+      }
+    },
+    "/v1/move": {
+      "post": {
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "from": {
+                    "type": "string"
+                  },
+                  "on_conflict": {
+                    "enum": [
+                      "fail",
+                      "overwrite",
+                      "rename"
+                    ],
+                    "type": "string"
+                  },
+                  "to": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "from",
+                  "to"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "summary": "move via the key's default drive",
+        "tags": [
+          "files"
+        ]
+      }
+    },
+    "/v1/search": {
+      "get": {
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "required": true,
+            "description": "search keywords"
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "required": false,
+            "description": "logical root of the search (default /)"
+          }
+        ],
+        "summary": "Case-insensitive substring search (OpenList index when enabled, else bounded walk)",
+        "tags": [
+          "browse"
+        ]
+      }
+    },
+    "/v1/selftest": {
+      "post": {
+        "summary": "Write+read+CRC64+delete roundtrip on every writable drive; records last_selftest_at",
+        "tags": [
+          "selftest"
+        ]
+      }
+    },
+    "/v1/stat": {
+      "get": {
+        "parameters": [
+          {
+            "name": "path",
+            "in": "query",
+            "required": true,
+            "description": "logical path"
+          }
+        ],
+        "summary": "stat via the key's default drive",
+        "tags": [
+          "files"
+        ]
+      }
+    },
+    "/v1/transfers": {
+      "post": {
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "description": "replay-safe retry within 24h"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "dry_run": {
+                    "description": "return would_affect {files,dirs,bytes} and the first 200 items without doing anything",
+                    "type": "boolean"
+                  },
+                  "from": {
+                    "description": "source",
+                    "properties": {
+                      "drive": {
+                        "type": "string"
+                      },
+                      "path": {
+                        "type": "string"
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "mode": {
+                    "default": "copy",
+                    "enum": [
+                      "copy",
+                      "move"
+                    ],
+                    "type": "string"
+                  },
+                  "on_conflict": {
+                    "default": "fail",
+                    "enum": [
+                      "fail",
+                      "overwrite",
+                      "rename"
+                    ],
+                    "type": "string"
+                  },
+                  "to": {
+                    "description": "destination",
+                    "properties": {
+                      "drive": {
+                        "type": "string"
+                      },
+                      "path": {
+                        "type": "string"
+                      }
+                    },
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "from",
+                  "to"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "summary": "Cross-drive (or same-drive) copy/move as a job; answers 202 {job}",
+        "tags": [
+          "jobs"
+        ]
+      }
+    },
+    "/v1/trash": {
+      "get": {
+        "summary": "This key's trash items",
+        "tags": [
+          "trash"
+        ]
+      }
+    },
+    "/v1/trash/purge": {
+      "post": {
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "id": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "id"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "summary": "Permanently remove one trash item (purge permission)",
+        "tags": [
+          "trash"
+        ]
+      }
+    },
+    "/v1/trash/restore": {
+      "post": {
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "id": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "id"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "summary": "Restore one trash item to its original path",
+        "tags": [
+          "trash"
+        ]
+      }
+    },
+    "/v1/tree": {
+      "get": {
+        "parameters": [
+          {
+            "name": "path",
+            "in": "query",
+            "required": false,
+            "description": "logical directory path (default /)"
+          },
+          {
+            "name": "depth",
+            "in": "query",
+            "required": false,
+            "description": "levels to descend (default 3, max 10)"
+          },
+          {
+            "name": "max_entries",
+            "in": "query",
+            "required": false,
+            "description": "entry cap (default 2000, max 10000)"
+          }
+        ],
+        "summary": "Directory tree of one path (bounded by depth and max_entries)",
+        "tags": [
+          "browse"
+        ]
+      }
+    }
+  },
+  "servers": [
+    {
+      "url": "https://cloud2api.example"
+    }
+  ]
+}

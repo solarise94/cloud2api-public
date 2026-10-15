@@ -1,0 +1,31 @@
+diff --git a/internal/op/fs.go b/internal/op/fs.go
+index f82a3ca..bc80543 100644
+--- a/internal/op/fs.go
++++ b/internal/op/fs.go
+@@ -48,7 +48,7 @@ func list(ctx context.Context, storage driver.Driver, path string, args model.Li
+ 		}
+ 	}
+ 
+-	objs, err, _ := listG.Do(key, func() ([]model.Obj, error) {
++	objs, err, _ := listG.Do(relayFlightKey(ctx, key), func() ([]model.Obj, error) {
+ 		dir, err := GetUnwrap(ctx, storage, path)
+ 		if err != nil {
+ 			return nil, errors.WithMessage(err, "failed get dir")
+@@ -270,7 +270,7 @@ func Link(ctx context.Context, storage driver.Driver, path string, args model.Li
+ 		return ol, nil
+ 	}
+ 	for {
+-		ol, err, _ := linkG.Do(key+"/"+typeKey, fn)
++		ol, err, _ := linkG.Do(relayFlightKey(ctx, key+"/"+typeKey), fn)
+ 		if err != nil {
+ 			return nil, nil, err
+ 		}
+@@ -308,7 +308,7 @@ func MakeDir(ctx context.Context, storage driver.Driver, path string) error {
+ 	}
+ 	path = utils.FixAndCleanPath(path)
+ 	key := Key(storage, path)
+-	_, err, _ := mkdirG.Do(key, func() (any, error) {
++	_, err, _ := mkdirG.Do(relayFlightKey(ctx, key), func() (any, error) {
+ 		// check if dir exists
+ 		f, err := Get(ctx, storage, path)
+ 		if err == nil {

@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex">
+<title>cloud2api 文件空间</title>
+<link rel="icon" type="image/png" href="/files/assets/logo.png">
+<link rel="stylesheet" href="/files/assets/app.css">
+<link rel="stylesheet" href="/files/assets/files.css">
+<script src="/files/assets/files.js" defer></script>
+</head>
+<body>
+
+<!-- MOCK/演示模式 banner：?mock=1 时由 files.js 显示；本模式下零真实网络请求 -->
+<div id="mock-banner" class="fx-mock" hidden>
+  <strong>MOCK 演示模式</strong>
+  <span class="fx-mock-txt">本页不会发出任何真实网络请求，全部数据是内存中的虚拟数据，刷新即重置。<b>登录时输入任意非空字符串即可（例如 demo），不要输入真实密钥。</b>演示网盘：baidu-demo（读/写/删/链）、readonly-archive（只读）、aliyun-broken（需重新授权，列表会报错）。</span>
+</div>
+
+<!-- ======== 门：粘贴 API Key（仅内存） ======== -->
+<section id="gate" class="fx-gate">
+  <div class="fx-brand">
+    <div class="fx-mark"><img src="/files/assets/logo.png" alt="cloud2api logo" width="84" height="84" decoding="async"></div>
+    <div>
+      <div class="fx-brand-name">cloud2api</div>
+      <div class="fx-brand-sub">网盘 · Agent 网关 — 文件空间</div>
+    </div>
+  </div>
+  <div class="card fx-gate-card">
+    <h1>文件空间</h1>
+    <p class="fx-hint">输入访问密钥，查看已授权的网盘，上传和分享文件。</p>
+    <form id="login-form" novalidate>
+      <label for="key">访问密钥（API Key）</label>
+      <div class="fx-keyrow">
+        <input type="password" id="key" class="input" placeholder="sk-c2a-…" autocomplete="off" spellcheck="false" autofocus>
+        <button type="button" id="key-toggle" class="btn btn-secondary">显示</button>
+      </div>
+      <p id="gate-err" class="field-error" role="alert"></p>
+      <button type="submit" id="gate-go" class="btn btn-primary btn-block">进入文件空间</button>
+    </form>
+    <p class="fx-privacy-sm">密钥仅保存在当前页面，刷新或退出后需重新输入。</p>
+    <details class="fx-more">
+      <summary>这是什么密钥？和管理员登录有什么区别？</summary>
+      <div class="fx-more-body">
+        <p>这里使用的是本实例签发的 <b>API Key</b>（sk-c2a-…，智能体接口密钥），不是管理员密码，也不是网盘（OpenList）的登录凭据。</p>
+        <p>能看到的网盘、可做的操作（浏览、上传、下载、删除、分享）完全由该 Key 的授权决定；没有授权的网盘不会出现，没有权限的操作不可用。需要签发或配置 Key、接入网盘，请前往<a href="/admin/">管理门户</a>。</p>
+      </div>
+    </details>
+  </div>
+  <p class="fx-foot">管理员？<a href="/admin/">进入管理门户</a>（签发 Key、配置网盘）</p>
+</section>
+
+<!-- ======== 工作区 ======== -->
+<div id="workspace" hidden>
+  <header class="fx-top">
+    <div class="fx-brand-sm">
+      <div class="fx-mark fx-mark-sm"><img src="/files/assets/logo.png" alt="" width="34" height="34" decoding="async"></div>
+      <div>
+        <div class="fx-brand-name fx-brand-name-sm">文件空间</div>
+        <div class="fx-keyline">Key <span id="me-prefix" class="chip">—</span></div>
+      </div>
+    </div>
+    <div class="fx-top-right">
+      <button type="button" id="theme-toggle" class="icon-btn" title="切换浅色/深色主题" aria-label="切换浅色/深色主题">
+        <svg class="ico-sun" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ico-moon" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+      </button>
+      <button type="button" id="logout" class="btn btn-ghost btn-sm">退出登录</button>
+    </div>
+  </header>
+
+  <p id="notice" class="fx-notice" role="status" hidden></p>
+
+  <main class="fx-shell">
+
+    <!-- 着陆：我的网盘卡片 -->
+    <section id="drives-home">
+      <div class="fx-pagehead">
+        <div>
+          <h2>我的网盘</h2>
+          <p id="drives-sub" class="fx-sub">正在读取此 Key 的授权（GET /v1/me）…</p>
+        </div>
+      </div>
+      <div id="drive-grid" class="drive-grid"></div>
+    </section>
+
+    <!-- 网盘目录浏览 -->
+    <section id="browser-view" hidden>
+      <div class="fx-pagehead fx-upload-head">
+        <div>
+          <h2>上传与分享</h2>
+        </div>
+        <div class="fx-upload-nav">
+          <button type="button" id="back-drives" class="btn btn-ghost btn-sm">← 我的网盘</button>
+          <button type="button" id="manager-toggle" class="btn btn-secondary btn-sm" aria-controls="file-manager" aria-expanded="true">收起文件管理</button>
+        </div>
+      </div>
+      <div class="fx-destination">
+        <span>上传位置</span>
+        <nav id="breadcrumb" class="fx-crumbs" aria-label="所在路径"></nav>
+      </div>
+
+      <!-- 拖放 / 点击 / 粘贴 上传 -->
+      <div id="dropzone" class="fx-dropzone" role="group" aria-label="上传文件：点击选择或拖放到此处">
+        <div class="fx-upload-icon" aria-hidden="true">
+          <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4m-4 4 4-4 4 4M4 15v4a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-4"/></svg>
+        </div>
+        <h3 id="dz-title" class="fx-dz-title">把文件拖到这里</h3>
+        <div id="dz-text" class="fx-dz-main">选择文件或直接粘贴，支持一次上传多个文件。</div>
+        <div class="fx-dz-opts">
+          <button type="button" id="choose-files" class="btn btn-primary fx-choose-files">选择文件</button>
+          <label class="fx-inline">同名冲突时
+            <select id="conflict-mode" class="select">
+              <option value="fail" selected>跳过（报错，不覆盖）</option>
+              <option value="rename">自动重命名（name (1).ext）</option>
+              <option value="overwrite">覆盖</option>
+            </select>
+          </label>
+          <label id="overwrite-row" class="check fx-overwrite-confirm" hidden>
+            <input type="checkbox" id="overwrite-ok"> 我确认要覆盖云端同名文件（替换内容，谨慎选择）
+          </label>
+        </div>
+        <p id="upload-hint" class="fx-upload-hint" hidden></p>
+      </div>
+      <input type="file" id="file-input" multiple class="visually-hidden" tabindex="-1" aria-hidden="true">
+
+      <!-- 上传队列：放在文件表上方，上传时进度始终可见 -->
+      <div class="card fx-uploadpanel" id="upload-panel" hidden>
+        <div class="fx-uphead">
+          <h3>上传记录与链接</h3>
+          <span id="upload-status" class="fx-sub">暂无任务</span>
+        </div>
+        <div id="upload-queue" class="fx-queue"></div>
+      </div>
+
+      <section id="file-manager" class="fx-file-manager" aria-label="文件管理">
+        <div class="fx-manager-head">
+          <h3>文件管理</h3>
+        </div>
+        <div class="fx-toolbar">
+          <label class="fx-search">当前页搜索
+            <input type="search" id="page-search" class="input" placeholder="过滤当前页（非全局搜索）" autocomplete="off">
+          </label>
+          <span class="fx-grow"></span>
+          <button type="button" id="refresh-btn" class="icon-btn" title="刷新当前目录" aria-label="刷新当前目录">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
+          </button>
+          <button type="button" id="mkdir-btn" class="btn btn-secondary btn-sm">新建文件夹</button>
+        </div>
+      <div class="card">
+        <div class="table-wrap">
+          <table id="file-list" class="tbl">
+            <thead>
+              <tr><th scope="col">名称</th><th scope="col">大小</th><th scope="col">修改时间</th><th scope="col" class="fx-th-actions">操作</th></tr>
+            </thead>
+            <tbody id="file-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="fx-pager">
+        <button type="button" id="page-prev" class="btn btn-secondary btn-sm">上一页</button>
+        <span id="page-info" class="fx-pageinfo"></span>
+        <button type="button" id="page-next" class="btn btn-secondary btn-sm">下一页</button>
+      </div>
+      </section>
+    </section>
+
+  </main>
+</div>
+
+<!-- ======== 对话框（原生 dialog：Esc 关闭、焦点圈定） ======== -->
+
+<dialog id="dlg-mkdir" class="fx-dlg" aria-labelledby="dlg-mkdir-title">
+  <form id="mkdir-form" novalidate>
+    <div class="fx-dlg-inner">
+      <h3 id="dlg-mkdir-title">新建文件夹</h3>
+      <p id="mkdir-where" class="fx-dlg-sub mono"></p>
+      <div class="field">
+        <label for="mkdir-name">文件夹名称</label>
+        <input type="text" id="mkdir-name" class="input" autocomplete="off" spellcheck="false" autofocus>
+        <p class="field-help">名称不能包含 <code>/</code>；需要 write 权限。</p>
+      </div>
+      <p id="mkdir-err" class="field-error" role="alert"></p>
+      <div class="fx-dlg-foot">
+        <button type="button" class="btn btn-secondary" data-close>取消</button>
+        <button type="submit" id="mkdir-ok" class="btn btn-primary">创建</button>
+      </div>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-rename" class="fx-dlg" aria-labelledby="dlg-rename-title">
+  <form id="rename-form" novalidate>
+    <div class="fx-dlg-inner">
+      <h3 id="dlg-rename-title">重命名</h3>
+      <p id="rename-old" class="fx-dlg-sub mono"></p>
+      <div class="field">
+        <label for="rename-name">新名称</label>
+        <input type="text" id="rename-name" class="input" autocomplete="off" spellcheck="false" autofocus>
+        <p class="field-help">仅修改名称，不移动位置；目标同名时报错（on_conflict=fail）。需要 write 权限。</p>
+      </div>
+      <p id="rename-err" class="field-error" role="alert"></p>
+      <div class="fx-dlg-foot">
+        <button type="button" class="btn btn-secondary" data-close>取消</button>
+        <button type="submit" id="rename-ok" class="btn btn-primary">重命名</button>
+      </div>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-delete" class="fx-dlg" aria-labelledby="dlg-delete-title">
+  <form id="delete-form" novalidate>
+    <div class="fx-dlg-inner">
+      <h3 id="dlg-delete-title">确认删除</h3>
+      <p class="fx-dlg-sub">将删除以下路径：</p>
+      <p id="delete-path" class="fx-delete-path mono"></p>
+      <p id="delete-note" class="fx-dlg-sub">若该 Key 开启了回收站，内容会先移入 /.c2a-trash 并在保留期后自动清除；否则为直接删除。需要 delete 权限。</p>
+      <p id="delete-err" class="field-error" role="alert"></p>
+      <div class="fx-dlg-foot">
+        <button type="button" class="btn btn-secondary" data-close>取消</button>
+        <button type="submit" id="delete-ok" class="btn btn-danger">确认删除</button>
+      </div>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-share" class="fx-dlg" aria-labelledby="dlg-share-title">
+  <form id="share-form" novalidate>
+    <div class="fx-dlg-inner">
+      <h3 id="dlg-share-title">分享链接</h3>
+      <p id="share-what" class="fx-dlg-sub mono"></p>
+      <p class="fx-dlg-sub">持有链接的人可下载，有效期内无需登录。</p>
+      <div class="field" id="share-ttl-field">
+        <label for="share-ttl">有效期</label>
+        <select id="share-ttl" class="select">
+          <option value="3600">1 小时</option>
+          <option value="86400">1 天</option>
+          <option value="259200">3 天</option>
+          <option value="604800">7 天（上限）</option>
+        </select>
+      </div>
+      <p id="share-err" class="field-error" role="alert"></p>
+      <div id="share-result" hidden>
+        <div class="field">
+          <label for="share-url">链接</label>
+          <div class="fx-share-row">
+            <input type="text" id="share-url" class="input mono" readonly>
+            <button type="button" id="share-copy" class="btn btn-secondary">复制</button>
+          </div>
+        </div>
+        <p id="share-exp" class="fx-sub"></p>
+      </div>
+      <div class="fx-dlg-foot">
+        <button type="button" class="btn btn-secondary" data-close>关闭</button>
+        <button type="submit" id="share-ok" class="btn btn-primary">生成链接</button>
+      </div>
+    </div>
+  </form>
+</dialog>
+
+</body>
+</html>
